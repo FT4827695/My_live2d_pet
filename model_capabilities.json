@@ -1,0 +1,9 @@
+{
+  "_default": {
+    "function_calling": true
+  },
+  "_unsupported_function_calling": [
+    "qwen1.5",
+    "qwen2"
+  ]
+}

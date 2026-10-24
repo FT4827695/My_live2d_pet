@@ -1,0 +1,11 @@
+{
+    "ctx": 16384,
+    "kv_cache": "q8_iq4",
+    "temperature": 1.0,
+    "vram_extra_mb": 768,
+    "enable_thinking": false,
+    "mtp": 1,
+    "voice_enabled": false,
+    "voice_shortcut": "off",
+    "mixed_kv_ratio": 0.97
+}

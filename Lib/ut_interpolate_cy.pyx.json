@@ -1,0 +1,130 @@
+# cython: language_level=3
+# cython: boundscheck=False
+# cython: wraparound=False
+# cython: cdivision=True
+"""
+ut_interpolate_cy.pyx
+interpolatePoints 逐点插值循环的 Cython 加速核心。
+"""
+# ============================================================
+#  pivotCount <= 0：直接复制
+# ============================================================
+def interp_pts_copy(
+    float[:] dst, int dst_offset, int dst_step,
+    const float[:] src, int num_pts
+):
+    cdef int bt = 0
+    cdef int aQ = dst_offset
+    cdef int aJ = num_pts * 2
+    if dst_step == 2 and dst_offset == 0:
+        dst[:aJ] = src[:aJ]
+    else:
+        while bt < aJ:
+            dst[aQ]     = src[bt]
+            bt += 1
+            dst[aQ + 1] = src[bt]
+            bt += 1
+            aQ += dst_step
+
+
+# ============================================================
+#  pivotCount == 1：2 个 pivot 线性插值
+# ============================================================
+def interp_pts_1(
+    float[:] dst, int dst_offset, int dst_step,
+    const float[:] p0, const float[:] p1,
+    float w0, int num_pts
+):
+    cdef int bt = 0
+    cdef int aQ = dst_offset
+    cdef int aJ = num_pts * 2
+    cdef float w1 = 1.0 - w0
+    while bt < aJ:
+        dst[aQ]     = p0[bt] * w1 + p1[bt] * w0
+        bt += 1
+        dst[aQ + 1] = p0[bt] * w1 + p1[bt] * w0
+        bt += 1
+        aQ += dst_step
+
+
+# ============================================================
+#  pivotCount == 2：4 个 pivot 双线性插值
+# ============================================================
+def interp_pts_2(
+    float[:] dst, int dst_offset, int dst_step,
+    const float[:] p0, const float[:] p1,
+    const float[:] p2, const float[:] p3,
+    float w0, float w1, float w2, float w3,
+    int num_pts
+):
+    cdef int bt = 0
+    cdef int aQ = dst_offset
+    cdef int aJ = num_pts * 2
+    while bt < aJ:
+        dst[aQ]     = w0*p0[bt] + w1*p1[bt] + w2*p2[bt] + w3*p3[bt]
+        bt += 1
+        dst[aQ + 1] = w0*p0[bt] + w1*p1[bt] + w2*p2[bt] + w3*p3[bt]
+        bt += 1
+        aQ += dst_step
+
+
+# ============================================================
+#  pivotCount == 3：8 个 pivot
+# ============================================================
+def interp_pts_3(
+    float[:] dst, int dst_offset, int dst_step,
+    const float[:] p0, const float[:] p1,
+    const float[:] p2, const float[:] p3,
+    const float[:] p4, const float[:] p5,
+    const float[:] p6, const float[:] p7,
+    float w0, float w1, float w2, float w3,
+    float w4, float w5, float w6, float w7,
+    int num_pts
+):
+    cdef int bt = 0
+    cdef int aQ = dst_offset
+    cdef int aJ = num_pts * 2
+    while bt < aJ:
+        dst[aQ] = (w0*p0[bt] + w1*p1[bt] + w2*p2[bt] + w3*p3[bt]
+                 + w4*p4[bt] + w5*p5[bt] + w6*p6[bt] + w7*p7[bt])
+        bt += 1
+        dst[aQ + 1] = (w0*p0[bt] + w1*p1[bt] + w2*p2[bt] + w3*p3[bt]
+                     + w4*p4[bt] + w5*p5[bt] + w6*p6[bt] + w7*p7[bt])
+        bt += 1
+        aQ += dst_step
+
+
+# ============================================================
+#  pivotCount == 4：16 个 pivot
+# ============================================================
+def interp_pts_4(
+    float[:] dst, int dst_offset, int dst_step,
+    const float[:] p0,  const float[:] p1,
+    const float[:] p2,  const float[:] p3,
+    const float[:] p4,  const float[:] p5,
+    const float[:] p6,  const float[:] p7,
+    const float[:] p8,  const float[:] p9,
+    const float[:] p10, const float[:] p11,
+    const float[:] p12, const float[:] p13,
+    const float[:] p14, const float[:] p15,
+    float w0,  float w1,  float w2,  float w3,
+    float w4,  float w5,  float w6,  float w7,
+    float w8,  float w9,  float w10, float w11,
+    float w12, float w13, float w14, float w15,
+    int num_pts
+):
+    cdef int bt = 0
+    cdef int aQ = dst_offset
+    cdef int aJ = num_pts * 2
+    while bt < aJ:
+        dst[aQ] = (w0*p0[bt]   + w1*p1[bt]   + w2*p2[bt]   + w3*p3[bt]
+                 + w4*p4[bt]   + w5*p5[bt]   + w6*p6[bt]   + w7*p7[bt]
+                 + w8*p8[bt]   + w9*p9[bt]   + w10*p10[bt] + w11*p11[bt]
+                 + w12*p12[bt] + w13*p13[bt] + w14*p14[bt] + w15*p15[bt])
+        bt += 1
+        dst[aQ + 1] = (w0*p0[bt]   + w1*p1[bt]   + w2*p2[bt]   + w3*p3[bt]
+                     + w4*p4[bt]   + w5*p5[bt]   + w6*p6[bt]   + w7*p7[bt]
+                     + w8*p8[bt]   + w9*p9[bt]   + w10*p10[bt] + w11*p11[bt]
+                     + w12*p12[bt] + w13*p13[bt] + w14*p14[bt] + w15*p15[bt])
+        bt += 1
+        aQ += dst_step

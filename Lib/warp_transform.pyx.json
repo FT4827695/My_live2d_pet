@@ -1,0 +1,380 @@
+# cython: language_level=3
+# cython: boundscheck=False
+# cython: wraparound=False
+# cython: cdivision=True
+"""
+warp_transform.pyx
+WarpDeformer 顶点变换的 Cython 计算核心。
+基于 warp_deformer-New.py 的 transformPoints_sdk2 优化版。
+"""
+
+
+cdef int _transform_sdk2(
+    float[:] src,
+    float[:] dst,
+    int pointCount,
+    int srcOffset,
+    int srcStep,
+    float[:] grid,
+    int row,
+    int col,
+):
+    """
+    核心顶点变换。返回 0 = 成功，-1 = 参数错误，-2 = BDBoxGrid 异常。
+    """
+    if pointCount <= 0 or srcStep < 2 or row <= 0 or col <= 0:
+        return -1
+
+    cdef int a1 = row + 1
+    cdef int stride = 2 * a1
+    cdef float row_f = <float>row
+    cdef float col_f = <float>col
+
+    cdef float aT = 0.0
+    cdef float aS = 0.0
+    cdef float bl = 0.0
+    cdef float bk = 0.0
+    cdef float bf = 0.0
+    cdef float be = 0.0
+    cdef bint aZ = False
+
+    cdef int i00 = 0
+    cdef int iR0 = 0
+    cdef int i0C = 0
+    cdef int iRC = 0
+
+    cdef int end = srcOffset + pointCount * srcStep
+    cdef int ba = 0
+    cdef int iu = 0
+    cdef int iv = 0
+    cdef int base = 0
+    cdef int p10 = 0
+    cdef int p01 = 0
+    cdef int p11 = 0
+    cdef float a4 = 0.0
+    cdef float aX = 0.0
+    cdef float bd = 0.0
+    cdef float a7 = 0.0
+    cdef float fu = 0.0
+    cdef float fv = 0.0
+    cdef float t = 0.0
+    cdef float w00 = 0.0
+    cdef float w11 = 0.0
+    cdef float w01 = 0.0
+    cdef float w10 = 0.0
+    cdef float aM = 0.0
+    cdef float aL = 0.0
+    cdef float bh = 0.0
+    cdef float bg = 0.0
+    cdef float a2 = 0.0
+    cdef float a3 = 0.0
+    cdef float a6 = 0.0
+    cdef float a8 = 0.0
+    cdef float aJ = 0.0
+    cdef float aK = 0.0
+    cdef float aN = 0.0
+    cdef float aO = 0.0
+    cdef float bj = 0.0
+    cdef float bi = 0.0
+    cdef float bb = 0.0
+    cdef float a9 = 0.0
+    cdef float bp = 0.0
+    cdef float bo = 0.0
+    cdef int aH = 0
+    cdef int aY = 0
+    cdef int idx0 = 0
+    cdef int idx1 = 0
+
+    for ba in range(srcOffset, end, srcStep):
+        a4 = src[ba]
+        aX = src[ba + 1]
+        bd = a4 * row_f
+        a7 = aX * col_f
+
+        # ============================================================
+        # inside fast path
+        # ============================================================
+        if 0.0 <= bd and bd < row_f and 0.0 <= a7 and a7 < col_f:
+            iu = <int>bd
+            iv = <int>a7
+            fu = bd - <float>iu
+            fv = a7 - <float>iv
+            base = 2 * (iu + iv * a1)
+            p10 = base + 2
+            p01 = base + stride
+            p11 = p01 + 2
+            t = fu + fv
+            if t < 1.0:
+                w00 = 1.0 - t
+                dst[ba]     = grid[base] * w00 + grid[p10] * fu + grid[p01] * fv
+                dst[ba + 1] = grid[base + 1] * w00 + grid[p10 + 1] * fu + grid[p01 + 1] * fv
+            else:
+                w11 = t - 1.0
+                w01 = 1.0 - fu
+                w10 = 1.0 - fv
+                dst[ba]     = grid[p11] * w11 + grid[p01] * w01 + grid[p10] * w10
+                dst[ba + 1] = grid[p11 + 1] * w11 + grid[p01 + 1] * w01 + grid[p10 + 1] * w10
+            continue
+
+        # ============================================================
+        # outside: 延迟初始化仿射量
+        # ============================================================
+        if not aZ:
+            aZ = True
+            i00 = 0
+            iR0 = 2 * row
+            i0C = col * stride
+            iRC = iR0 + i0C
+            aT = 0.25 * (grid[i00] + grid[iR0] + grid[i0C] + grid[iRC])
+            aS = 0.25 * (grid[i00 + 1] + grid[iR0 + 1] + grid[i0C + 1] + grid[iRC + 1])
+            aM = grid[iRC] - grid[i00]
+            aL = grid[iRC + 1] - grid[i00 + 1]
+            bh = grid[iR0] - grid[i0C]
+            bg = grid[iR0 + 1] - grid[i0C + 1]
+            bl = (aM + bh) * 0.5
+            bk = (aL + bg) * 0.5
+            bf = (aM - bh) * 0.5
+            be = (aL - bg) * 0.5
+            aT -= 0.5 * (bl + bf)
+            aS -= 0.5 * (bk + be)
+
+        # ============================================================
+        # outside: 近外区域 (-2, 3)
+        # ============================================================
+        if -2.0 < a4 and a4 < 3.0 and -2.0 < aX and aX < 3.0:
+
+            if a4 <= 0.0:
+                # ---- 左列 ----
+                if aX <= 0.0:
+                    a3 = grid[0]
+                    a2 = grid[1]
+                    a8 = aT - 2.0 * bl
+                    a6 = aS - 2.0 * bk
+                    aK = aT - 2.0 * bf
+                    aJ = aS - 2.0 * be
+                    aO = aT - 2.0 * bl - 2.0 * bf
+                    aN = aS - 2.0 * bk - 2.0 * be
+                    bj = 0.5 * (a4 + 2.0)
+                    bi = 0.5 * (aX + 2.0)
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+                elif aX >= 1.0:
+                    aK = grid[i0C]
+                    aJ = grid[i0C + 1]
+                    aO = aT - 2.0 * bl + bf
+                    aN = aS - 2.0 * bk + be
+                    a3 = aT + 3.0 * bf
+                    a2 = aS + 3.0 * be
+                    a8 = aT - 2.0 * bl + 3.0 * bf
+                    a6 = aS - 2.0 * bk + 3.0 * be
+                    bj = 0.5 * (a4 + 2.0)
+                    bi = 0.5 * (aX - 1.0)
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+                else:
+                    aH = <int>a7
+                    if aH == col:
+                        aH = col - 1
+                    bj = 0.5 * (a4 + 2.0)
+                    bi = a7 - <float>aH
+                    bb = (<float>aH) / col_f
+                    a9 = (<float>(aH + 1)) / col_f
+                    idx0 = aH * stride
+                    idx1 = (aH + 1) * stride
+                    aK = grid[idx0]
+                    aJ = grid[idx0 + 1]
+                    a3 = grid[idx1]
+                    a2 = grid[idx1 + 1]
+                    aO = aT - 2.0 * bl + bb * bf
+                    aN = aS - 2.0 * bk + bb * be
+                    a8 = aT - 2.0 * bl + a9 * bf
+                    a6 = aS - 2.0 * bk + a9 * be
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+            elif a4 >= 1.0:
+                # ---- 右列 ----
+                if aX <= 0.0:
+                    a8 = grid[iR0]
+                    a6 = grid[iR0 + 1]
+                    a3 = aT + 3.0 * bl
+                    a2 = aS + 3.0 * bk
+                    aO = aT + bl - 2.0 * bf
+                    aN = aS + bk - 2.0 * be
+                    aK = aT + 3.0 * bl - 2.0 * bf
+                    aJ = aS + 3.0 * bk - 2.0 * be
+                    bj = 0.5 * (a4 - 1.0)
+                    bi = 0.5 * (aX + 2.0)
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+                elif aX >= 1.0:
+                    aO = grid[iRC]
+                    aN = grid[iRC + 1]
+                    aK = aT + 3.0 * bl + bf
+                    aJ = aS + 3.0 * bk + be
+                    a8 = aT + bl + 3.0 * bf
+                    a6 = aS + bk + 3.0 * be
+                    a3 = aT + 3.0 * bl + 3.0 * bf
+                    a2 = aS + 3.0 * bk + 3.0 * be
+                    bj = 0.5 * (a4 - 1.0)
+                    bi = 0.5 * (aX - 1.0)
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+                else:
+                    aH = <int>a7
+                    if aH == col:
+                        aH = col - 1
+                    bj = 0.5 * (a4 - 1.0)
+                    bi = a7 - <float>aH
+                    bb = (<float>aH) / col_f
+                    a9 = (<float>(aH + 1)) / col_f
+                    idx0 = iR0 + aH * stride
+                    idx1 = iR0 + (aH + 1) * stride
+                    aO = grid[idx0]
+                    aN = grid[idx0 + 1]
+                    a8 = grid[idx1]
+                    a6 = grid[idx1 + 1]
+                    aK = aT + 3.0 * bl + bb * bf
+                    aJ = aS + 3.0 * bk + bb * be
+                    a3 = aT + 3.0 * bl + a9 * bf
+                    a2 = aS + 3.0 * bk + a9 * be
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+            else:
+                # ---- 中间列（0 < a4 < 1）----
+                if aX <= 0.0:
+                    aY = <int>bd
+                    if aY == row:
+                        aY = row - 1
+                    bj = bd - <float>aY
+                    bi = 0.5 * (aX + 2.0)
+                    bp = (<float>aY) / row_f
+                    bo = (<float>(aY + 1)) / row_f
+                    idx0 = 2 * aY
+                    idx1 = 2 * (aY + 1)
+                    a8 = grid[idx0]
+                    a6 = grid[idx0 + 1]
+                    a3 = grid[idx1]
+                    a2 = grid[idx1 + 1]
+                    aO = aT + bp * bl - 2.0 * bf
+                    aN = aS + bp * bk - 2.0 * be
+                    aK = aT + bo * bl - 2.0 * bf
+                    aJ = aS + bo * bk - 2.0 * be
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+                elif aX >= 1.0:
+                    aY = <int>bd
+                    if aY == row:
+                        aY = row - 1
+                    bj = bd - <float>aY
+                    bi = 0.5 * (aX - 1.0)
+                    bp = (<float>aY) / row_f
+                    bo = (<float>(aY + 1)) / row_f
+                    idx0 = 2 * aY + i0C
+                    idx1 = 2 * (aY + 1) + i0C
+                    aO = grid[idx0]
+                    aN = grid[idx0 + 1]
+                    aK = grid[idx1]
+                    aJ = grid[idx1 + 1]
+                    a8 = aT + bp * bl + 3.0 * bf
+                    a6 = aS + bp * bk + 3.0 * be
+                    a3 = aT + bo * bl + 3.0 * bf
+                    a2 = aS + bo * bk + 3.0 * be
+                    if bj + bi <= 1.0:
+                        dst[ba]     = aO + (aK - aO) * bj + (a8 - aO) * bi
+                        dst[ba + 1] = aN + (aJ - aN) * bj + (a6 - aN) * bi
+                    else:
+                        dst[ba]     = a3 + (a8 - a3) * (1.0 - bj) + (aK - a3) * (1.0 - bi)
+                        dst[ba + 1] = a2 + (a6 - a2) * (1.0 - bj) + (aJ - a2) * (1.0 - bi)
+
+                else:
+                    return -2
+
+        else:
+            # ============================================================
+            # outside: 远外线性外推
+            # ============================================================
+            dst[ba]     = aT + a4 * bl + aX * bf
+            dst[ba + 1] = aS + a4 * bk + aX * be
+
+    return 0
+
+
+def transform_sdk2(src, dst, int pointCount, int srcOffset, int srcStep,
+                   grid, int row, int col):
+    """
+    Python 可调用的包装函数。
+    src, dst, grid: array.array('f') 或任何支持 buffer protocol 的 float32 数组。
+    """
+    cdef float[:] src_mv = src
+    cdef float[:] dst_mv = dst
+    cdef float[:] grid_mv = grid
+    cdef int ret = _transform_sdk2(
+        src_mv, dst_mv, pointCount, srcOffset, srcStep,
+        grid_mv, row, col,
+    )
+    if ret == -1:
+        return
+    if ret == -2:
+        raise RuntimeError("error @BDBoxGrid")
+
+
+def apply_inside_cache(dst, grid, list cache, int num_point, int offset, int step):
+    """
+    缓存命中时的快速路径。
+    cache: list of (i0, i1, i2, w0, w1, w2) 元组。
+    """
+    cdef float[:] dst_mv = dst
+    cdef float[:] grid_mv = grid
+    cdef int ba = offset
+    cdef int idx = 0
+    cdef int i0, i1, i2
+    cdef float w0, w1, w2
+    cdef tuple entry
+
+    while idx < num_point:
+        entry = cache[idx]
+        i0 = entry[0]
+        i1 = entry[1]
+        i2 = entry[2]
+        w0 = entry[3]
+        w1 = entry[4]
+        w2 = entry[5]
+        dst_mv[ba]     = grid_mv[i0] * w0 + grid_mv[i1] * w1 + grid_mv[i2] * w2
+        dst_mv[ba + 1] = grid_mv[i0 + 1] * w0 + grid_mv[i1 + 1] * w1 + grid_mv[i2 + 1] * w2
+        ba += step
+        idx += 1
