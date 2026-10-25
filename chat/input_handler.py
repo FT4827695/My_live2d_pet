@@ -640,12 +640,17 @@ class InputHandler:
             if self._chat_ctrl.copyselected_messages():
                 return
             return
-        # 回车发送
+        # 回车：Ctrl + Enter 换行，普通 Enter 发送
         if key in (glfw.KEY_ENTER, glfw.KEY_KP_ENTER):
             if self._get_input_focus():
-                self._chat_ctrl.send_message()
-            return
-        if not self._get_input_focus():
+                if mods & glfw.MOD_CONTROL:
+                    if action == glfw.PRESS:
+                        self._input_box.insert_text("\n")
+                        self._request_update()
+                        self._mark_dirty()
+                else:
+                    if action == glfw.PRESS:
+                        self._chat_ctrl.send_message()
             return
         ib = self._input_box
         # 退格
