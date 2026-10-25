@@ -2,7 +2,7 @@
     "ctx": 16384,
     "kv_cache": "q8_iq4",
     "temperature": 1.0,
-    "vram_extra_mb": 768,
+    "vram_extra_mb": 512,
     "enable_thinking": false,
     "mtp": 1,
     "voice_enabled": false,
