@@ -583,21 +583,35 @@ class MessageProcessor:
 
         supports_fc = self.pet.llm_engine.supports_function_calling()
         thinking_mode = self._is_thinking_mode()
-
         from prompt import (
             get_tool_agent_system_prompt,
             get_legacy_code_agent_system_prompt,
         )
-
+        # ===== 联网搜索开关与白名单来源 =====
+        web_search_enabled = False
+        web_search_source_names = ""
+        if supports_fc:
+            try:
+                from internet_settings import InternetSettings
+                _internet = InternetSettings.get_instance()
+                if _internet.is_enabled:
+                    _names = _internet.enabled_source_names()
+                    if _names and _names != "无":
+                        web_search_enabled = True
+                        web_search_source_names = _names
+            except Exception as e:
+                print(f"[MessageProcessor] 读取联网设置失败: {e}")
+                web_search_enabled = False
         if supports_fc:
             system_prompt = get_tool_agent_system_prompt(
-                thinking_mode=thinking_mode
+                thinking_mode=thinking_mode,
+                web_search_enabled=web_search_enabled
             )
         else:
             system_prompt = get_legacy_code_agent_system_prompt(
                 thinking_mode=thinking_mode
             )
-    
+        
         # ===== index_hint =====
         index_hint = ""
 
@@ -792,6 +806,8 @@ class MessageProcessor:
                 get_read_file_tool_schema,
                 get_export_result_tool_schema,
                 get_view_image_tool_schema,
+                get_web_search_tool_schema,
+                get_read_web_article_tool_schema,
             )
 
             tools = [
@@ -802,6 +818,9 @@ class MessageProcessor:
                 get_view_image_tool_schema(),
             ]
 
+            if web_search_enabled:
+                tools.append(get_web_search_tool_schema(web_search_source_names))
+                tools.append(get_read_web_article_tool_schema())
             driver = ToolLoopDriver(self.pet)
 
             final_reply, raw_result, output, used_fc = driver.run(
@@ -840,6 +859,25 @@ class MessageProcessor:
                 stats=stats,
                 generation_id=generation_id,
             )
+
+        # ============ 防幻觉拦截  ============
+        if supports_fc and not used_fc and final_reply and isinstance(final_reply, str):
+            has_fake_source = ("来源：" in final_reply or "来源:" in final_reply 
+                               or "http://" in final_reply or "https://" in final_reply)
+            if has_fake_source:
+                print("[MessageProcessor] 拦截：模型未调用工具却编造了来源链接")
+                cut_idx = len(final_reply)
+                for marker in ["来源：", "来源:", "http://", "https://"]:
+                    idx = final_reply.find(marker)
+                    if idx != -1 and idx < cut_idx:
+                        cut_idx = idx
+                if cut_idx < len(final_reply):
+                    final_reply = final_reply[:cut_idx].strip()
+                    if final_reply:
+                        final_reply += "\n\n（系统提示：刚才未实际联网搜索。）"
+                    else:
+                        final_reply = "（我刚才没有真正联网搜索，无法提供准确的来源链接。）"
+            
         # ==================================================
 
         fail_code = self._detect_reply_failure(final_reply)

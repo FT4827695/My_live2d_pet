@@ -97,6 +97,25 @@ _TOOL_RULES = (
     "6. 如果用户质疑回答错误，必须重新调用工具验证并给出正确结果。\n"
 )
 
+# ================== 工具调用模式：联网搜索纪律 ==================
+
+_WEB_SEARCH_RULES = (
+    "\n联网搜索纪律：\n"
+    "1. 仅当问题涉及实时资讯、时效性信息、你知识截止后的事实、"
+    "或用户明确要求联网查证时，才调用 web_search。"
+    "本地文件问答、数值计算一律禁止搜索；"
+    "计算必须走 execute_python_code。\n"
+    "2. 判断信息是否过时以消息中的 <sys_time> 标签为准，不要依赖自身记忆里的日期。\n"
+    "3. 回答必须基于 web_search 返回的摘要或 read_web_article 返回的正文。"
+    "搜索结果与自身知识冲突时，以搜索结果为准，并可简要说明差异。\n"
+    "4. 禁止编造搜索结果、标题、内容或 URL。"
+    "搜不到就如实告知；可以更换关键词重试一次，仍无结果则明确说明未能查到。\n"
+    "5. 使用搜索结果作答时，最终回复末尾必须以纯文本列出来源，"
+    " 每行格式为「来源：<标题> <链接>」，只列出实际用到的来源。\n"
+    "6. 部分来源（如百度百科、知乎）为动态渲染，不支持读取正文；"
+    "对这类来源只依据搜索摘要作答，不要调用 read_web_article。\n"
+    "7. 避免对同一内容反复搜索；摘要已足够回答时，不要再读取正文。\n"
+)
 
 # ================== 工具调用模式：思考模式补充 ==================
 
@@ -170,16 +189,17 @@ def _build_character_prefix() -> str:
 
 # ================== 对外核心接口 ==================
 
-def get_tool_agent_system_prompt(thinking_mode: bool = False) -> str:
+def get_tool_agent_system_prompt(
+    thinking_mode: bool = False,
+    web_search_enabled: bool = False
+) -> str:
     base = _build_character_prefix() + "\n" + _CORE_RULES_TOOL
-
     if thinking_mode:
         base += _THINKING_RULES_TOOL
-
     base += _TOOL_RULES
-
+    if web_search_enabled:
+        base += _WEB_SEARCH_RULES
     return base
-
 
 def get_legacy_code_agent_system_prompt(thinking_mode: bool = False) -> str:
     base = _build_character_prefix() + "\n" + _CORE_RULES_LEGACY
@@ -194,13 +214,15 @@ def get_legacy_code_agent_system_prompt(thinking_mode: bool = False) -> str:
 
 def get_agent_system_prompt(
     include_tool_rules: bool = True,
-    thinking_mode: bool = False
+    thinking_mode: bool = False,
+    web_search_enabled: bool = False
 ) -> str:
     if include_tool_rules:
-        return get_tool_agent_system_prompt(thinking_mode=thinking_mode)
-
+        return get_tool_agent_system_prompt(
+            thinking_mode=thinking_mode,
+            web_search_enabled=web_search_enabled
+        )
     return get_legacy_code_agent_system_prompt(thinking_mode=thinking_mode)
-
 
 # ================== 向下兼容 ==================
 

@@ -231,8 +231,9 @@ class MenuManager:
         # 折叠菜单状态
         self.load_submenu_expanded = False
         self.param_submenu_expanded = False
+        self.network_submenu_expanded = False
         self.voice_submenu_expanded = False
-
+        
         # 模型加载参数配置
         self.model_settings = ModelSettings()
 
@@ -441,7 +442,40 @@ class MenuManager:
                 ]
             )
 
-        # ---------- 原有设置项 ----------
+        # ---------- 一级菜单：网络设置（折叠） ----------
+        network_arrow = "[-]" if self.network_submenu_expanded else "[+]"
+        items.append(
+            {
+                "id": "network_settings",
+                "text": f"网络设置                 {network_arrow}",
+                "enabled": True,
+            }
+        )
+
+        # ---------- 二级菜单：联网搜索 / 网站和代理 ----------
+        if self.network_submenu_expanded:
+            try:
+                from internet_settings import InternetSettings
+                _web_search_on = InternetSettings.get_instance().is_enabled
+            except Exception:
+                _web_search_on = False
+            items.extend(
+                [
+                    {
+                        "id": "web_search_toggle",
+                        "text": indent + f"联网搜索：{'开启' if _web_search_on else '关闭'}",
+                        "enabled": True,
+                    },
+                    {
+                        "id": "internet_settings_file",
+                        "text": indent + "网站和代理",
+                        "enabled": True,
+                    },
+                ]
+            )
+        items.append({"id": "sep_internet", "text": "", "enabled": False})
+        
+        # ---------- 设置项 ----------
         items.extend(
             [
                 {"id": "character_file", "text": "模型人设", "enabled": can_load},
@@ -491,6 +525,7 @@ class MenuManager:
         self.hovered_menu_item = None
         self.load_submenu_expanded = False
         self.param_submenu_expanded = False
+        self.network_submenu_expanded = False
 
     # ==================== 延迟防抖播报 ====================
     def _schedule_announce(self, key: str, message: str) -> None:
@@ -644,6 +679,76 @@ class MenuManager:
         except Exception as e:
             self.add_message("shizuku", f"打开文件失败: {e}")
 
+    # ==================== 联网搜索：开关与配置 ====================
+
+    def _toggle_web_search(self) -> None:
+        try:
+            from internet_settings import InternetSettings
+        except Exception as e:
+            self.add_message("shizuku", f"联网设置模块不可用: {e}")
+            return
+        settings = InternetSettings.get_instance()
+        # 重载磁盘配置，避免覆盖手动修改
+        settings.reload()
+        next_value = not settings.is_enabled
+        settings.set_enabled(next_value)
+        self.refresh_settings_menu(clear_rects=False)
+        if next_value:
+            names = settings.enabled_source_names()
+            if not names or names == "无":
+                self.add_message(
+                    "shizuku",
+                    "联网搜索已开启，但白名单里没有启用的来源，"
+                    "请先点「网站和代理」配置。"
+                )
+            else:
+                self.add_message(
+                    "shizuku",
+                    f"联网搜索已开启，下一轮对话即可使用。可用来源：{names}"
+                )
+        else:
+            self.add_message("shizuku", "联网搜索已关闭。")
+
+    def _open_internet_settings_file(self) -> None:
+        try:
+            from internet_settings import InternetSettings
+        except Exception as e:
+            self.add_message("shizuku", f"联网设置模块不可用: {e}")
+            return
+        path = InternetSettings.get_settings_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except json.JSONDecodeError as e:
+                self.add_message(
+                    "shizuku",
+                    f"警告：Internet_setting.json 语法有误（第{e.lineno}行：{e.msg}），"
+                    f"已按上次有效配置运行。请修正后保存。"
+                )
+            except Exception as e:
+                self.add_message("shizuku", f"警告：配置文件读取异常：{e}")
+        try:
+            InternetSettings.get_instance().reload()
+        except Exception:
+            pass
+        if not os.path.exists(path):
+            self.add_message("shizuku", "未找到联网配置文件。")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", path])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            self.add_message("shizuku", f"打开文件失败: {e}")
+            return
+        self.add_message("shizuku", "已打开联网配置，修改保存后下一轮对话生效。")
+        
     # ==================== 设置菜单A：命令处理 ====================
     def handle_settings_command(self, cmd: str) -> None:
         # 折叠菜单：加载本地模型
@@ -654,6 +759,7 @@ class MenuManager:
                 else:
                     self.load_submenu_expanded = True
                     self.param_submenu_expanded = False
+                    self.network_submenu_expanded = False
                 self.refresh_settings_menu(clear_rects=True)
             return
 
@@ -665,6 +771,7 @@ class MenuManager:
                 else:
                     self.param_submenu_expanded = True
                     self.load_submenu_expanded = False
+                    self.network_submenu_expanded = False
                 self.refresh_settings_menu(clear_rects=True)
             return
 
@@ -687,7 +794,24 @@ class MenuManager:
         if cmd == "param_mtp":
             self._cycle_mtp()
             return
+        if cmd == "network_settings":
+            if self.network_submenu_expanded:
+                self.network_submenu_expanded = False
+            else:
+                self.network_submenu_expanded = True
+                self.load_submenu_expanded = False
+                self.param_submenu_expanded = False
+            self.refresh_settings_menu(clear_rects=True)
+            return
 
+        # 联网搜索：开关 / 打开配置文件
+        if cmd == "web_search_toggle":
+            self._toggle_web_search()
+            return
+        if cmd == "internet_settings_file":
+            self._open_internet_settings_file()
+            return
+        
         if cmd == "character_file":
             if self._can_load_model():
                 if self.on_open_character_editor is not None:

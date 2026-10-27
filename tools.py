@@ -145,6 +145,71 @@ def get_export_result_tool_schema():
     }
 
 
+def get_web_search_tool_schema(source_names: str):
+    return {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "strict": True,
+            "description": (
+                "在指定的白名单网站中搜索时效性信息或你不确定的事实。"
+                f"当前允许搜索的来源仅限：{source_names}。禁止搜索白名单以外的网站。"
+                "仅当问题涉及实时资讯、知识截止后的事实、或用户明确要求联网查证时才调用；"
+                "本地文件分析、数值计算禁止使用本工具。"
+                "返回带编号的结果摘要列表；如需某条结果的正文，再调用 read_web_article。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100,
+                        "description": "搜索关键词，简洁准确，必要时使用中文。"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "description": "每个来源返回的最大结果数，默认3。"
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False
+            }
+        }
+    }
+
+
+def get_read_web_article_tool_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "read_web_article",
+            "strict": True,
+            "description": (
+                "读取 web_search 返回的某条结果的正文内容。"
+                "参数 identifier 传入搜索结果中的 ID（如 wiki_zh_3），"
+                "或白名单域名内的完整链接。"
+                "仅当摘要不足以回答问题时才调用；禁止用于白名单以外的网址。"
+                "部分动态渲染来源（如百度百科、知乎）不支持读取正文，"
+                "此时应依据摘要作答，不要重复尝试。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "identifier": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "web_search 结果中的引用 ID，或白名单域名内的 http/https 链接。"
+                    }
+                },
+                "required": ["identifier"],
+                "additionalProperties": False
+            }
+        }
+    }
+
 # ==================== 2. Tool Loop 驱动器 ====================
 
 class ToolLoopDriver:
@@ -157,6 +222,8 @@ class ToolLoopDriver:
             f"{json.dumps(data, ensure_ascii=False)}"
         ),
         "execute_python_code": lambda data: f"代码输出结果：\n{data}",
+        "web_search": lambda data: f"联网搜索结果：\n{data}",
+        "read_web_article": lambda data: f"网页正文内容：\n{data}",
     }
 
     def __init__(self, pet_instance):
@@ -265,6 +332,31 @@ class ToolLoopDriver:
 
             return {}, None
 
+        elif func_name == "web_search":
+            query = args.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return None, "缺少必填参数 'query'，或 'query' 为空。"
+            query = query.strip()
+            if len(query) > 100:
+                return None, "参数 'query' 过长，精简到100字以内再搜索。"
+            max_results = args.get("max_results")
+            if max_results is None:
+                return {"query": query}, None
+            if isinstance(max_results, bool):
+                return None, "参数 'max_results' 必须是1到8之间的整数。"
+            try:
+                max_results = int(float(max_results))
+            except (ValueError, TypeError):
+                return None, f"参数 'max_results' 必须是1到8之间的整数，当前值为 '{max_results}'。"
+            if max_results < 1 or max_results > 8:
+                return None, f"参数 'max_results' 必须在1到8之间，当前值为 {max_results}。"
+            return {"query": query, "max_results": max_results}, None
+        elif func_name == "read_web_article":
+            identifier = args.get("identifier")
+            if not isinstance(identifier, str) or not identifier.strip():
+                return None, "缺少必填参数 'identifier'，或 'identifier' 为空。"
+            return {"identifier": identifier.strip()}, None
+        
         else:
             return None, f"未知工具: {func_name}"
 
@@ -481,6 +573,23 @@ class ToolLoopDriver:
                                     "请确认是否有可导出的结果（需先进行计算或分析），或检查 format 参数是否合法。"
                                 )
 
+                        elif func_name == "web_search":
+                            sr = self._run_web_search(args, _aborted)
+                            structured_result.update(sr)
+                            if not structured_result.get("ok"):
+                                structured_result.setdefault(
+                                    "next_action",
+                                    "可更换关键词重试一次，仍失败则如实告知用户。"
+                                )
+                        elif func_name == "read_web_article":
+                            sr = self._run_read_web_article(args)
+                            structured_result.update(sr)
+                            if not structured_result.get("ok"):
+                                structured_result.setdefault(
+                                    "next_action",
+                                    "请依据已有搜索摘要作答，不要重复重试。"
+                                )                        
+
                         else:
                             structured_result["error_type"] = "unknown_tool"
                             structured_result["error"] = f"未知工具：{func_name}"
@@ -627,3 +736,82 @@ class ToolLoopDriver:
             return {"ok": False, "error_type": "path_error", "error": "找不到桌面路径。"}
 
         return {"ok": False, "error_type": "save_failed", "error": f"保存失败（{err}）。"}
+
+    def _run_web_search(self, args, aborted):
+        try:
+            from internet_settings import InternetSettings
+            from web_search import run_web_search, format_search_results
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_type": "module_error",
+                "error": f"联网搜索模块不可用：{e}",
+                "next_action": "请告知用户联网搜索功能暂不可用，依据已有知识作答。"
+            }
+        if not InternetSettings.get_instance().is_enabled:
+            return {
+                "ok": False,
+                "error_type": "feature_disabled",
+                "error": "联网搜索当前未开启。",
+                "next_action": "请告知用户需在设置中开启联网搜索，本轮依据已有知识作答。"
+            }
+        try:
+            res = run_web_search(args["query"], args.get("max_results"), aborted=aborted)
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_type": "search_exception",
+                "error": f"搜索过程异常：{e}",
+                "next_action": "可更换关键词重试一次，仍失败则如实告知用户。"
+            }
+        if not res.get("ok"):
+            return {
+                "ok": False,
+                "error_type": res.get("error_type", "search_failed"),
+                "error": res.get("error", "搜索失败"),
+                "next_action": res.get("next_action", "可更换关键词重试一次。")
+            }
+        data = format_search_results(res["results"], res.get("failed_sources"))
+        return {"ok": True, "data": data}
+
+    def _run_read_web_article(self, args):
+        try:
+            from internet_settings import InternetSettings
+            from web_search import run_read_article
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_type": "module_error",
+                "error": f"联网搜索模块不可用：{e}",
+                "next_action": "请告知用户联网搜索功能暂不可用，依据搜索摘要作答。"
+            }
+        if not InternetSettings.get_instance().is_enabled:
+            return {
+                "ok": False,
+                "error_type": "feature_disabled",
+                "error": "联网搜索当前未开启。",
+                "next_action": "请告知用户需在设置中开启联网搜索，依据已有知识作答。"
+            }
+        try:
+            res = run_read_article(args["identifier"])
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_type": "fetch_exception",
+                "error": f"正文读取异常：{e}",
+                "next_action": "请依据已有搜索摘要作答。"
+            }
+        if not res.get("ok"):
+            return {
+                "ok": False,
+                "error_type": res.get("error_type", "fetch_failed"),
+                "error": res.get("error", "正文读取失败"),
+                "next_action": res.get("next_action", "请依据搜索摘要作答，不要重复重试。")
+            }
+        data = (
+            f"标题：{res.get('title', '')}\n"
+            f"来源：{res.get('source_name', '')}\n"
+            f"链接：{res.get('url', '')}\n"
+            f"正文：\n{res.get('text', '')}"
+        )
+        return {"ok": True, "data": data}
