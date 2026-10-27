@@ -1,7 +1,7 @@
 {
     "ctx": 16384,
     "kv_cache": "q8_iq4",
-    "temperature": 1.0,
+    "temperature": 0.7,
     "vram_extra_mb": 512,
     "enable_thinking": false,
     "mtp": 1,

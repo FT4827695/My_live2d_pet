@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import copy
 import threading
 
 
@@ -23,6 +24,9 @@ _DEFAULT_SETTINGS = {
     "cache_ttl_sec": 600,
     "max_snippet_chars": 1024,
     "max_article_chars": 2048,
+    "tavily_enabled": True,
+    "tavily_api_key": "",
+    "tavily_fallback_to_general": True,
     "sources": [
         {
             "id": "bing_news",
@@ -31,44 +35,22 @@ _DEFAULT_SETTINGS = {
             "display_name": "Bing新闻"
         },
         {
-            "id": "moegirl",
-            "type": "mediawiki",
-            "enabled": False,
-            "display_name": "萌娘百科",
-            "api_base": "https://zh.moegirl.org.cn/api.php"
-        },
-        {
             "id": "baidu_baike",
             "type": "site_search",
             "enabled": True,
-            "display_name": "百度百科",
-            "target_domain": "baike.baidu.com",
-            "no_body": True
+            "display_name": "百度",
+            "target_domain": "www.baidu.com",
+            "use_site_operator": False,
+            "no_body": False
         },
         {
-            "id": "zhihu",
+            "id": "sogou",
             "type": "site_search",
             "enabled": True,
-            "display_name": "知乎",
-            "target_domain": "zhihu.com",
+            "display_name": "搜狗",
+            "target_domain": "www.sogou.com",
+            "use_site_operator": False,
             "no_body": True
-        },
-        {
-            "id": "wiki_zh",
-            "type": "mediawiki",
-            "enabled": False,
-            "display_name": "维基百科(中文)",
-            "api_base": "https://zh.wikipedia.org/w/api.php",
-            "mirror_api_bases": [
-                "https://wikipedia.wikipedia.sh/w/api.php"
-            ]
-        },
-        {
-            "id": "github",
-            "type": "github_api",
-            "enabled": False,
-            "display_name": "GitHub",
-            "target_domain": "github.com"
         }
     ]
 }
@@ -96,19 +78,19 @@ class InternetSettings:
                 with open(_INTERNET_SETTING_PATH, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
-                    self._data = dict(_DEFAULT_SETTINGS)
+                    self._data = copy.deepcopy(_DEFAULT_SETTINGS)
                     self._data.update(saved)
                     if not isinstance(self._data.get("sources"), list):
-                        self._data["sources"] = list(_DEFAULT_SETTINGS["sources"])
+                        self._data["sources"] = copy.deepcopy(_DEFAULT_SETTINGS["sources"])
                 else:
-                    self._data = dict(_DEFAULT_SETTINGS)
+                    self._data = copy.deepcopy(_DEFAULT_SETTINGS)
             else:
-                self._data = dict(_DEFAULT_SETTINGS)
+                self._data = copy.deepcopy(_DEFAULT_SETTINGS)
                 self._save()
                 print("[InternetSettings] 首次运行，已生成默认 Internet_setting.json")
         except Exception as e:
             print(f"[InternetSettings] 读取配置失败: {e}")
-            self._data = dict(_DEFAULT_SETTINGS)
+            self._data = copy.deepcopy(_DEFAULT_SETTINGS)
 
     def _save(self):
         try:
@@ -171,6 +153,18 @@ class InternetSettings:
         except Exception:
             return 2048
 
+    @property
+    def tavily_enabled(self) -> bool:
+        return bool(self._data.get("tavily_enabled", True))
+
+    @property
+    def tavily_api_key(self) -> str:
+        return str(self._data.get("tavily_api_key", "")).strip()
+
+    @property
+    def tavily_fallback_to_general(self) -> bool:
+        return bool(self._data.get("tavily_fallback_to_general", True))
+
     def enabled_sources(self) -> list:
         sources = self._data.get("sources", [])
         return [s for s in sources if isinstance(s, dict) and s.get("enabled", False)]
@@ -182,19 +176,21 @@ class InternetSettings:
         return None
 
     _TYPE_LABELS = {
-        "mediawiki": "百科",
-        "github_api": "代码",
         "site_search": "通用",
         "news_search": "资讯",
     }
 
     def enabled_source_names(self) -> str:
+        """把当前生效的搜索来源汇总成一行，供工具描述使用。
+        Tavily 作为主通道固定在前，sources 兜底源按配置顺序追加。"""
         names = []
+        if self.tavily_enabled:
+            names.append("Tavily[AI]")
         for s in self.enabled_sources():
             label = self._TYPE_LABELS.get(str(s.get("type", "")), "通用")
             names.append(f"{s.get('display_name', s.get('id', ''))}[{label}]")
         return ", ".join(names) if names else "无"
-    
+
     # ---------- 写接口 ----------
     def set_enabled(self, value: bool):
         self._data["web_search_enabled"] = bool(value)

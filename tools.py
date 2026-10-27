@@ -399,6 +399,8 @@ class ToolLoopDriver:
         current_messages = list(messages)
         used_fc = False
 
+        searched_queries = set()
+
         active_image_paths = []
 
         if df is None and dfs is None and cache_pool:
@@ -574,21 +576,27 @@ class ToolLoopDriver:
                                 )
 
                         elif func_name == "web_search":
-                            sr = self._run_web_search(args, _aborted)
-                            structured_result.update(sr)
-                            if not structured_result.get("ok"):
-                                structured_result.setdefault(
-                                    "next_action",
-                                    "可更换关键词重试一次，仍失败则如实告知用户。"
+                            q = str(args.get("query", "")).strip().lower()
+                            if q in searched_queries:
+                                structured_result["ok"] = False
+                                structured_result["error_type"] = "duplicate_query"
+                                structured_result["error"] = (
+                                    f"query '{args.get('query')}' 已经搜过，结果重复。"
                                 )
-                        elif func_name == "read_web_article":
-                            sr = self._run_read_web_article(args)
-                            structured_result.update(sr)
-                            if not structured_result.get("ok"):
-                                structured_result.setdefault(
-                                    "next_action",
-                                    "请依据已有搜索摘要作答，不要重复重试。"
-                                )                        
+                                structured_result["next_action"] = (
+                                    "不要重复搜索同一个词。"
+                                    "请从已有结果里选 1-2 条调用 read_web_article 读正文，"
+                                    "或换一个明显不同且更短的关键词。"
+                                )
+                            else:
+                                searched_queries.add(q)
+                                sr = self._run_web_search(args, _aborted)
+                                structured_result.update(sr)
+                                if not structured_result.get("ok"):
+                                    structured_result.setdefault(
+                                        "next_action",
+                                        "可更换关键词重试一次，仍失败则如实告知用户。"
+                                    )
 
                         else:
                             structured_result["error_type"] = "unknown_tool"
@@ -757,6 +765,7 @@ class ToolLoopDriver:
             }
         try:
             res = run_web_search(args["query"], args.get("max_results"), aborted=aborted)
+            titles = [r.get("title", "") for r in res.get("results", [])]
         except Exception as e:
             return {
                 "ok": False,

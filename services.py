@@ -57,7 +57,7 @@ class TextUtils:
             text
         )
 
-        return text.replace('', '').replace('□', '').replace('\r', '')
+        return text.replace('​', '').replace('□', '').replace('\r', '')
 
     @staticmethod
     def extract_code_block(text: str):
@@ -505,50 +505,6 @@ class MessageProcessor:
             "filename_base": "计算结果", "source_label": "计算结果",
         }
 
-    def _verify_tool_consistency(self, user_msg, final_reply, used_fc,
-                                 messages, tools, stats, generation_id):
-        if used_fc or not final_reply or tools is None:
-            return final_reply, used_fc
-
-        first_line = final_reply.split('\n', 1)[0]
-        claims_tool = '[TOOL]' in first_line
-
-        suspicious = False
-        reason = ""
-
-        if claims_tool:
-            suspicious = True
-            reason = "标注了[TOOL]但本轮并未发起任何工具调用"
-
-        if not suspicious:
-            return final_reply, used_fc
-
-        reflect_messages = messages + [
-            {"role": "assistant", "content": final_reply},
-            {"role": "user", "content": (
-                f"[系统校验] {reason}。\n"
-                f"重新处理：必须读取文件或计算，现在调用工具；"
-            )}
-        ]
-
-        from tools import ToolLoopDriver
-
-        driver = ToolLoopDriver(self.pet)
-
-        retry_reply, raw_result, output, retry_used_fc = driver.run(
-            reflect_messages, tools,
-            cache_pool=self.cache_pool,
-            max_loops=8,
-            generation_id=generation_id,
-            message_processor=self,
-            stats=stats,
-            image_paths=[],
-        )
-
-        if retry_reply:
-            return retry_reply, retry_used_fc or used_fc
-
-        return final_reply, used_fc
 
     def _safe_append_history_agent(self, u_msg, a_msg, generation_id, used_fc=False):
         if generation_id is None or self.pet.is_generation_current(generation_id):
@@ -588,17 +544,18 @@ class MessageProcessor:
             get_legacy_code_agent_system_prompt,
         )
         # ===== 联网搜索开关与白名单来源 =====
+        # Step 4：Tavily 作为主通道，sources 作为兜底；两者任一可用即放行 web_search 工具
         web_search_enabled = False
         web_search_source_names = ""
         if supports_fc:
             try:
                 from internet_settings import InternetSettings
                 _internet = InternetSettings.get_instance()
-                if _internet.is_enabled:
-                    _names = _internet.enabled_source_names()
-                    if _names and _names != "无":
-                        web_search_enabled = True
-                        web_search_source_names = _names
+                if _internet.is_enabled and (
+                    _internet.tavily_enabled or bool(_internet.enabled_sources())
+                ):
+                    web_search_enabled = True
+                    web_search_source_names = _internet.enabled_source_names()
             except Exception as e:
                 print(f"[MessageProcessor] 读取联网设置失败: {e}")
                 web_search_enabled = False
@@ -848,35 +805,42 @@ class MessageProcessor:
                 image_paths=[],
             )
             
-        # ============ 一致性校验 ============
-        if supports_fc:
-            final_reply, used_fc = self._verify_tool_consistency(
-                user_msg=user_msg,
-                final_reply=final_reply,
-                used_fc=used_fc,
-                messages=messages,
-                tools=tools,
-                stats=stats,
-                generation_id=generation_id,
-            )
-
         # ============ 防幻觉拦截  ============
-        if supports_fc and not used_fc and final_reply and isinstance(final_reply, str):
-            has_fake_source = ("来源：" in final_reply or "来源:" in final_reply 
-                               or "http://" in final_reply or "https://" in final_reply)
-            if has_fake_source:
-                print("[MessageProcessor] 拦截：模型未调用工具却编造了来源链接")
-                cut_idx = len(final_reply)
-                for marker in ["来源：", "来源:", "http://", "https://"]:
-                    idx = final_reply.find(marker)
-                    if idx != -1 and idx < cut_idx:
-                        cut_idx = idx
-                if cut_idx < len(final_reply):
-                    final_reply = final_reply[:cut_idx].strip()
-                    if final_reply:
-                        final_reply += "\n\n（系统提示：刚才未实际联网搜索。）"
-                    else:
-                        final_reply = "（我刚才没有真正联网搜索，无法提供准确的来源链接。）"
+        if (supports_fc and not used_fc and web_search_enabled
+                and final_reply and isinstance(final_reply, str)):
+            fact_patterns = [
+                r"20\d{2}\s*年",
+                r"\d{1,2}\s*月\s*\d{1,2}\s*日",
+            ]
+            has_specific_date = any(re.search(p, final_reply) for p in fact_patterns)
+            has_quote_source = ("来源：" in final_reply or "来源:" in final_reply
+                                or "http://" in final_reply or "https://" in final_reply)
+
+            if has_specific_date or has_quote_source:
+                print("[MessageProcessor] 检测到未验证的时效性事实，强制重试并调用 web_search")
+                reflect_messages = messages + [
+                    {"role": "assistant", "content": final_reply},
+                    {"role": "user", "content": (
+                        "[系统校验] 你的回复包含具体的时效性事实（年份/日期/来源），"
+                        "但本轮没有调用任何工具。\n"
+                        "现在必须调用 web_search 验证这些信息，禁止基于记忆作答。"
+                        "搜索后，若结果与你的记忆冲突，以搜索结果为准。"
+                    )},
+                ]
+                from tools import ToolLoopDriver
+                driver = ToolLoopDriver(self.pet)
+                retry_reply, raw_result, output, retry_used_fc = driver.run(
+                    reflect_messages, tools,
+                    cache_pool=self.cache_pool,
+                    max_loops=6,
+                    generation_id=generation_id,
+                    message_processor=self,
+                    stats=stats,
+                    image_paths=[],
+                )
+                if retry_reply and retry_used_fc:
+                    final_reply = retry_reply
+                    used_fc = True
             
         # ==================================================
 

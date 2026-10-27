@@ -6,6 +6,9 @@
     "cache_ttl_sec": 600,
     "max_snippet_chars": 1024,
     "max_article_chars": 2048,
+    "tavily_enabled": true,
+    "tavily_api_key": "",
+    "tavily_fallback_to_general": true,
     "sources": [
         {
             "id": "bing_news",
@@ -14,44 +17,22 @@
             "display_name": "Bing新闻"
         },
         {
-            "id": "moegirl",
-            "type": "mediawiki",
-            "enabled": false,
-            "display_name": "萌娘百科",
-            "api_base": "https://zh.moegirl.org.cn/api.php"
-        },
-        {
             "id": "baidu_baike",
             "type": "site_search",
             "enabled": true,
-            "display_name": "百度百科",
-            "target_domain": "baike.baidu.com",
-            "no_body": true
+            "display_name": "百度",
+            "target_domain": "www.baidu.com",
+            "use_site_operator": false,
+            "no_body": false
         },
         {
-            "id": "zhihu",
+            "id": "sogou",
             "type": "site_search",
             "enabled": true,
-            "display_name": "知乎",
-            "target_domain": "zhihu.com",
+            "display_name": "搜狗",
+            "target_domain": "www.sogou.com",
+            "use_site_operator": false,
             "no_body": true
-        },
-        {
-            "id": "wiki_zh",
-            "type": "mediawiki",
-            "enabled": false,
-            "display_name": "维基百科(中文)",
-            "api_base": "https://zh.wikipedia.org/w/api.php",
-            "mirror_api_bases": [
-                "https://wikipedia.wikipedia.sh/w/api.php"
-            ]
-        },
-        {
-            "id": "github",
-            "type": "github_api",
-            "enabled": false,
-            "display_name": "GitHub",
-            "target_domain": "github.com"
         }
     ]
 }

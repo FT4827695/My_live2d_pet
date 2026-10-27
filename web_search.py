@@ -6,10 +6,10 @@
   format_search_results(results, failed_sources)
 """
 import re
-import json
 import time
 import threading
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse
+import base64
 
 import requests
 import html
@@ -18,14 +18,24 @@ from internet_settings import InternetSettings
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
-    "DesktopPet-Shizuku/1.0 (personal desktop assistant)"
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 _MAX_TOTAL_RESULTS = 12
 _CONNECT_TIMEOUT = 5
 
+
+# ==================== 异常类型 ====================
+
 class SearchSourceError(Exception):
+    pass
+
+
+class TavilyRateLimitError(SearchSourceError):
+    pass
+
+
+class TavilyUnavailableError(SearchSourceError):
     pass
 
 
@@ -37,6 +47,7 @@ def _strip_html(text):
     text = re.sub(r"<[^>]+>", "", str(text))
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
+
 
 def _truncate(text, max_chars):
     text = (text or "").strip()
@@ -56,38 +67,26 @@ def _host_of(url):
         return ""
 
 
-# ==================== 端点记忆 ====================
-
-class EndpointMemory:
-    _success_routes = {}
-    _lock = threading.Lock()
-
-    @classmethod
-    def order(cls, source_id, candidates):
-        cleaned = []
-        for u in candidates:
-            u = str(u or "").strip().rstrip("/")
-            if u and u not in cleaned:
-                cleaned.append(u)
-        if not cleaned:
-            return []
-        with cls._lock:
-            remembered = cls._success_routes.get(source_id)
-        if remembered in cleaned:
-            cleaned.remove(remembered)
-            return [remembered] + cleaned
-        return cleaned
-
-    @classmethod
-    def record_success(cls, source_id, url):
-        with cls._lock:
-            cls._success_routes[source_id] = url
-
-    @classmethod
-    def clear(cls):
-        with cls._lock:
-            cls._success_routes.clear()
-
+def _clean_bing_url(url: str) -> str:
+    if not url:
+        return url
+    if "bing.com/ck/a" in url:
+        from urllib.parse import urlparse, parse_qs
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            u_param = qs.get("u")
+            if u_param:
+                b64_str = u_param[0]
+                if b64_str.startswith("a1"):
+                    b64_str = b64_str[2:]
+                b64_str += "=" * (-len(b64_str) % 4)
+                real_url = base64.urlsafe_b64decode(b64_str).decode("utf-8")
+                if real_url.startswith("http"):
+                    return real_url
+        except Exception:
+            pass
+    return url
 
 # ==================== TTL 缓存 ====================
 
@@ -165,176 +164,119 @@ class BaseSourceAdapter:
         raise NotImplementedError
 
 
-# ==================== MediaWiki 适配器 ====================
+# ==================== Tavily 适配器 ====================
 
-class MediaWikiAdapter(BaseSourceAdapter):
-    source_type = "mediawiki"
+class TavilyAdapter(BaseSourceAdapter):
+    source_type = "tavily"
+    SEARCH_URL = "https://api.tavily.com/search"
+    EXTRACT_URL = "https://api.tavily.com/extract"
 
-    def _candidate_endpoints(self):
-        candidates = [self.config.get("api_base", "")]
-        candidates.extend(self.config.get("mirror_api_bases", []) or [])
-        return EndpointMemory.order(self.source_id, candidates)
+    def __init__(self, source_config=None):
+        super().__init__(source_config or {"id": "tavily", "display_name": "Tavily"})
 
-    def _request(self, params):
+    def _headers(self):
+        settings = InternetSettings.get_instance()
+        headers = {"Content-Type": "application/json"}
+        api_key = settings.tavily_api_key
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["X-Tavily-Access-Mode"] = "keyless"
+        return headers
+
+    def search(self, query, max_results):
         session = self._session()
+        payload = {
+            "query": query,
+            "max_results": int(max_results) if max_results else 5,
+        }
         try:
-            for endpoint in self._candidate_endpoints():
-                try:
-                    resp = session.get(endpoint, params=params, timeout=self._timeout())
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, dict) and "error" not in data:
-                            EndpointMemory.record_success(self.source_id, endpoint)
-                            return data
-                except Exception as e:
-                    print(f"[WebSearch] MediaWiki 端点失败 {endpoint}: {e}")
-            raise SearchSourceError("所有端点均不可用")
+            resp = session.post(
+                self.SEARCH_URL,
+                headers=self._headers(),
+                json=payload,
+                timeout=self._timeout(),
+            )
+        except requests.exceptions.RequestException as e:
+            raise TavilyUnavailableError(f"Tavily 网络异常: {e}")
         finally:
             session.close()
 
-    def _page_url(self, title, endpoint):
-        if not endpoint:
-            return ""
-        try:
-            base = re.sub(r"/w/api\.php$", "", endpoint)
-            base = re.sub(r"/api\.php$", "", base)
-            return f"{base}/wiki/{quote(str(title).replace(' ', '_'))}"
-        except Exception:
-            return ""
+        if resp.status_code == 429:
+            raise TavilyRateLimitError("Tavily 触发限流 (HTTP 429)")
+        if resp.status_code in (401, 403):
+            raise TavilyUnavailableError(f"Tavily 鉴权失败 (HTTP {resp.status_code})")
+        if resp.status_code >= 500:
+            raise TavilyUnavailableError(f"Tavily 服务端错误 (HTTP {resp.status_code})")
+        if resp.status_code != 200:
+            raise TavilyUnavailableError(f"Tavily 返回异常状态码 {resp.status_code}")
 
-    def search(self, query, max_results):
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "srlimit": max_results,
-            "format": "json",
-            "formatversion": "2",
-        }
-        data = self._request(params)
-        session = self._session()  # 仅用于记录成功端点的展示 URL
-        session.close()
+        try:
+            data = resp.json()
+        except Exception:
+            raise TavilyUnavailableError("Tavily 返回非 JSON 内容")
+
         results = []
-        success_route = None
-        with EndpointMemory._lock:
-            success_route = EndpointMemory._success_routes.get(self.source_id)
-        for item in (data.get("query", {}).get("search", []) or []):
-            title = item.get("title", "")
-            if not title:
+        for item in (data.get("results") or []):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            title = str(item.get("title", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if not url and not title:
                 continue
             results.append({
                 "title": title,
-                "url": self._page_url(title, success_route or self.config.get("api_base", "")),
-                "snippet": _strip_html(item.get("snippet", "")),
-                "fetch_info": {
-                    "kind": "mediawiki",
-                    "pageid": item.get("pageid"),
-                    "title": title,
-                },
+                "url": url,
+                "snippet": _strip_html(content),
+                "fetch_info": {"kind": "tavily_url", "url": url},
             })
+            if len(results) >= max_results:
+                break
         return results
 
     def fetch_article(self, info, max_chars):
-        params = {
-            "action": "query",
-            "prop": "extracts",
-            "exintro": "1",
-            "explaintext": "1",
-            "format": "json",
-            "formatversion": "2",
-        }
-        pageid = info.get("pageid")
-        if pageid:
-            params["pageids"] = pageid
-        else:
-            params["titles"] = info.get("title", "")
-            params["redirects"] = "1"
-        data = self._request(params)
-        pages = data.get("query", {}).get("pages", []) or []
-        if not pages:
+        url = str(info.get("url", "")).strip()
+        if not url:
             return None
-        return _truncate(pages[0].get("extract", ""), max_chars)
 
-
-# ==================== GitHub 适配器 ====================
-
-class GitHubAdapter(BaseSourceAdapter):
-    source_type = "github_api"
-    API_BASE = "https://api.github.com"
-
-    def _search_via_api(self, query, max_results):
         session = self._session()
-        session.headers.update({"Accept": "application/vnd.github+json"})
         try:
-            resp = session.get(
-                f"{self.API_BASE}/search/repositories",
-                params={"q": query, "per_page": max_results},
+            resp = session.post(
+                self.EXTRACT_URL,
+                headers=self._headers(),
+                json={"urls": [url]},
                 timeout=self._timeout(),
             )
-            if resp.status_code != 200:
-                print(f"[WebSearch] GitHub API 返回 {resp.status_code}")
-                return None
-            results = []
-            for item in (resp.json().get("items", []) or [])[:max_results]:
-                full_name = item.get("full_name", "")
-                desc = item.get("description") or ""
-                parts = [desc] if desc else []
-                if item.get("language"):
-                    parts.append(f"语言: {item['language']}")
-                parts.append(f"stars: {item.get('stargazers_count', 0)}")
-                results.append({
-                    "title": full_name,
-                    "url": item.get("html_url", ""),
-                    "snippet": " | ".join(parts),
-                    "fetch_info": {"kind": "github_repo", "full_name": full_name},
-                })
-            return results
-        except Exception as e:
-            print(f"[WebSearch] GitHub API 搜索异常: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"[WebSearch] Tavily extract 网络异常: {e}")
             return None
         finally:
             session.close()
 
-    def _fallback_site_search(self, query, max_results):
-        fallback = BingSiteSearchAdapter({
-            "id": self.source_id,
-            "display_name": self.display_name,
-            "target_domain": self.config.get("target_domain", "github.com"),
-        })
-        return fallback.search(query, max_results)
-
-    def search(self, query, max_results):
-        results = self._search_via_api(query, max_results)
-        if results is not None:
-            return results
-        print("[WebSearch] GitHub 官方 API 不可用，回退 site: 搜索")
-        return self._fallback_site_search(query, max_results)
-
-    def fetch_article(self, info, max_chars):
-        kind = info.get("kind", "")
-        if kind == "generic_url":
-            return BingSiteSearchAdapter(self.config).fetch_article(info, max_chars)
-        full_name = info.get("full_name", "")
-        if not full_name:
+        if resp.status_code == 429:
+            print("[WebSearch] Tavily extract 触发限流 (HTTP 429)，正文不可得")
             return None
-        session = self._session()
-        session.headers.update({"Accept": "application/vnd.github.raw"})
+        if resp.status_code != 200:
+            print(f"[WebSearch] Tavily extract 返回 {resp.status_code}")
+            return None
+
         try:
-            resp = session.get(
-                f"{self.API_BASE}/repos/{full_name}/readme",
-                timeout=self._timeout(),
-            )
-            if resp.status_code != 200:
-                return None
-            return _truncate(resp.text, max_chars)
-        except Exception as e:
-            print(f"[WebSearch] GitHub README 读取失败: {e}")
+            data = resp.json()
+        except Exception:
             return None
-        finally:
-            session.close()
+
+        results = data.get("results") or []
+        if not results or not isinstance(results[0], dict):
+            return None
+
+        raw = results[0].get("raw_content") or ""
+        if not str(raw).strip():
+            return None
+        return _truncate(str(raw), max_chars)
 
 
-# ==================== Bing site: 兜底适配器 ====================
+# ==================== Bing site: 通用 / 兜底适配器 ====================
 
 class BingSiteSearchAdapter(BaseSourceAdapter):
     source_type = "site_search"
@@ -342,13 +284,17 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
 
     def search(self, query, max_results):
         domain = str(self.config.get("target_domain", "")).strip()
-        full_query = f"site:{domain} {query}" if domain else query
+        use_site = self.config.get("use_site_operator", True)
+        full_query = f"site:{domain} {query}" if (domain and use_site) else query
         session = self._session()
-        session.headers.update({"Accept-Language": "zh-CN,zh;q=0.9"})
+        session.headers.update({
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        })
         try:
             resp = session.get(
                 self.SEARCH_URL,
-                params={"q": full_query, "count": max_results, "ensearch": "0"},
+                params={"q": full_query, "count": max_results, "mkt": "zh-CN"},
                 timeout=self._timeout(),
             )
             if resp.status_code != 200:
@@ -370,6 +316,29 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
             raise SearchSourceError("缺少依赖 beautifulsoup4")
         soup = BeautifulSoup(html, "html.parser")
         results = []
+
+        for ans in soup.select("div.b_ans, div.b_vidAns, div.b_entityTP"):
+            h2 = ans.find("h2")
+            if not h2:
+                continue
+            a = h2.find("a")
+            if not a or not a.get("href"):
+                continue
+            snippet_el = ans.select_one("div.b_caption p") or ans.find("p")
+            real_href = _clean_bing_url(a["href"])
+            if not real_href.startswith(("http://", "https://")):
+                from urllib.parse import urljoin
+                real_href = urljoin("https://www.bing.com", real_href)
+
+            results.append({
+                "title": h2.get_text(strip=True),
+                "url": real_href,
+                "snippet": snippet_el.get_text(" ", strip=True) if snippet_el else ans.get_text(" ", strip=True)[:300],
+                "fetch_info": {"kind": "generic_url", "url": real_href},
+            })
+            if len(results) >= max_results:
+                return results
+
         for li in soup.select("li.b_algo"):
             h2 = li.find("h2")
             if not h2:
@@ -378,11 +347,19 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
             if not a or not a.get("href"):
                 continue
             snippet_el = li.select_one("div.b_caption p") or li.find("p")
+
+            raw_href = a["href"]
+            real_href = _clean_bing_url(raw_href)
+
+            if not real_href.startswith(("http://", "https://")):
+                from urllib.parse import urljoin
+                real_href = urljoin("https://cn.bing.com", real_href)
+
             results.append({
                 "title": a.get_text(strip=True),
-                "url": a["href"],
+                "url": real_href,
                 "snippet": snippet_el.get_text(" ", strip=True) if snippet_el else "",
-                "fetch_info": {"kind": "generic_url", "url": a["href"]},
+                "fetch_info": {"kind": "generic_url", "url": real_href},
             })
             if len(results) >= max_results:
                 break
@@ -409,17 +386,23 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
         finally:
             session.close()
 
+
+# ==================== Bing 新闻适配器 ====================
+
 class BingNewsAdapter(BaseSourceAdapter):
     source_type = "news_search"
     SEARCH_URL = "https://cn.bing.com/news/search"
 
     def search(self, query, max_results):
         session = self._session()
-        session.headers.update({"Accept-Language": "zh-CN,zh;q=0.9"})
+        session.headers.update({
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        })
         try:
             resp = session.get(
                 self.SEARCH_URL,
-                params={"q": query, "count": max_results, "ensearch": "0"},
+                params={"q": query, "count": max_results, "mkt": "zh-CN"},
                 timeout=self._timeout(),
             )
             if resp.status_code != 200:
@@ -441,12 +424,12 @@ class BingNewsAdapter(BaseSourceAdapter):
             raise SearchSourceError("缺少依赖 beautifulsoup4")
         soup = BeautifulSoup(html, "html.parser")
         results = []
-        
-        # 策略1: 尝试标准新闻卡片结构
+
         cards = soup.select("div.news-card") or soup.select("div.caption")
         for card in cards:
             title = (card.get("data-title") or "").strip()
             url = (card.get("data-url") or "").strip()
+            url = _clean_bing_url(url)
             if not title or not url:
                 a = card.select_one("a.title") or card.find("a")
                 if a:
@@ -471,7 +454,6 @@ class BingNewsAdapter(BaseSourceAdapter):
             if len(results) >= max_results:
                 break
 
-        # 策略2: 回退到普通搜索结果 (li.b_algo)
         if not results:
             for li in soup.select("li.b_algo"):
                 h2 = li.find("h2")
@@ -481,6 +463,7 @@ class BingNewsAdapter(BaseSourceAdapter):
                 if not a or not a.get("href"):
                     continue
                 snippet_el = li.select_one("div.b_caption p") or li.find("p")
+                real_href = _clean_bing_url(a["href"])
                 results.append({
                     "title": a.get_text(strip=True),
                     "url": a["href"],
@@ -489,11 +472,12 @@ class BingNewsAdapter(BaseSourceAdapter):
                 })
                 if len(results) >= max_results:
                     break
-                    
+
         return results
-    
+
     def fetch_article(self, info, max_chars):
         return BingSiteSearchAdapter(self.config).fetch_article(info, max_chars)
+
 
 def _extract_page_text(html, max_chars):
     try:
@@ -522,17 +506,20 @@ def _extract_page_text(html, max_chars):
         total += len(text)
         if total > max_chars * 2:
             break
-    text = "\n".join(paragraphs) if paragraphs else main.get_text("\n", strip=True)
+
+    if len(paragraphs) < 3:
+        text = main.get_text("\n", strip=True)
+    else:
+        text = "\n".join(paragraphs)
+
     return _truncate(text, max_chars)
 
 
-# ==================== 搜索引擎 ====================
+# ==================== 适配器注册 ====================
 
 _ADAPTER_CLASSES = {
-    "mediawiki": MediaWikiAdapter,
-    "github_api": GitHubAdapter,
     "site_search": BingSiteSearchAdapter,
-    "news_search": BingNewsAdapter, 
+    "news_search": BingNewsAdapter,
 }
 
 
@@ -542,6 +529,8 @@ def _build_adapter(source_config):
         return None
     return cls(source_config)
 
+
+# ==================== 搜索引擎 ====================
 
 class WebSearchEngine:
     def __init__(self):
@@ -561,23 +550,65 @@ class WebSearchEngine:
         query = str(query or "").strip()
         if not query:
             return {"ok": False, "error_type": "missing_arg", "error": "query 为空"}
-        sources = settings.enabled_sources()
-        if not sources:
-            return {
-                "ok": False,
-                "error_type": "no_enabled_source",
-                "error": "白名单中没有启用任何搜索来源。",
-                "next_action": "请告知用户当前未配置可用的搜索网站。",
-            }
+
+        if not re.search(r'[a-zA-Z]', query) and re.search(r'[\u4e00-\u9fa5]', query):
+            query = query.replace(" ", "")
+
         try:
             per_source = int(max_results) if max_results else settings.max_results_per_source
         except Exception:
             per_source = settings.max_results_per_source
         per_source = max(1, min(per_source, 8))
 
+        tavily_fail_reason = None
+
+        # ===== Step 3: Tavily 优先 =====
+        if settings.tavily_enabled:
+            raw_tavily, tavily_fail_reason = self._search_via_tavily(
+                query, per_source, aborted
+            )
+            if raw_tavily:
+                return self._format_tavily_results(raw_tavily)
+
+            if tavily_fail_reason == "aborted":
+                return {
+                    "ok": False,
+                    "error_type": "aborted",
+                    "error": "搜索已被中止。",
+                }
+
+            if not settings.tavily_fallback_to_general:
+                return {
+                    "ok": False,
+                    "error_type": f"tavily_{tavily_fail_reason or 'failed'}",
+                    "error": (
+                        f"Tavily 搜索失败（{tavily_fail_reason or '未知原因'}），"
+                        f"且未启用通用搜索兜底。"
+                    ),
+                    "next_action": "请稍后重试，或在设置中开启通用搜索兜底。",
+                }
+
+            print(f"[WebSearch] Tavily 不可用（{tavily_fail_reason}），降级到通用搜索")
+
+        # ===== 通用搜索兜底 =====
+        sources = settings.enabled_sources()
+        if not sources:
+            detail_parts = []
+            if tavily_fail_reason:
+                detail_parts.append(f"Tavily（{tavily_fail_reason}）")
+            detail = "；".join(detail_parts) if detail_parts else "白名单中没有启用任何搜索来源。"
+            return {
+                "ok": False,
+                "error_type": "no_enabled_source",
+                "error": f"未获得可用搜索结果。{detail}",
+                "next_action": "请告知用户当前未配置可用的搜索网站。",
+            }
+
         all_results = []
         failed_sources = []
         seen_urls = set()
+        seen_types = set()
+
         for source in sources:
             if aborted is not None and aborted():
                 break
@@ -586,6 +617,10 @@ class WebSearchEngine:
             adapter = _build_adapter(source)
             if adapter is None:
                 continue
+            if adapter.source_type == "site_search" and not adapter.config.get("use_site_operator", True):
+                if "site_search_global" in seen_types:
+                    continue
+                seen_types.add("site_search_global")
             cache_key = (adapter.source_id, _normalize_query(query))
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -626,14 +661,84 @@ class WebSearchEngine:
                 })
 
         if not all_results:
-            detail = "；".join(failed_sources) if failed_sources else "未匹配到内容"
+            detail_parts = []
+            if tavily_fail_reason:
+                detail_parts.append(f"Tavily（{tavily_fail_reason}）")
+            if failed_sources:
+                detail_parts.extend(failed_sources)
+            detail = "；".join(detail_parts) if detail_parts else "未匹配到内容"
             return {
                 "ok": False,
                 "error_type": "no_results",
                 "error": f"未获得可用搜索结果。{detail}",
                 "next_action": "可尝试更换关键词重试一次；仍无结果则如实告知用户未搜到。",
             }
+
+        if tavily_fail_reason:
+            failed_sources.append(f"Tavily（{tavily_fail_reason}）")
+
         return {"ok": True, "results": all_results, "failed_sources": failed_sources}
+
+    # ---------- Tavily 封装 ----------
+    def _search_via_tavily(self, query, per_source, aborted):
+        """
+        返回 (raw_results, fail_reason)。
+          - 成功且至少 1 条：raw_results 非空，fail_reason 为 None
+          - 失败：raw_results 为 None，fail_reason 为
+            "rate_limited" / "unavailable" / "no_results" / "aborted" / "exception"
+        """
+        settings = InternetSettings.get_instance()
+
+        cache_key = ("tavily", _normalize_query(query))
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached, None
+
+        if aborted is not None and aborted():
+            return None, "aborted"
+
+        adapter = TavilyAdapter()
+        try:
+            raw_results = adapter.search(query, per_source)
+        except TavilyRateLimitError as e:
+            print(f"[WebSearch] Tavily 限流: {e}")
+            return None, "rate_limited"
+        except TavilyUnavailableError as e:
+            print(f"[WebSearch] Tavily 不可用: {e}")
+            return None, "unavailable"
+        except Exception as e:
+            print(f"[WebSearch] Tavily 搜索异常: {e}")
+            return None, "exception"
+
+        if aborted is not None and aborted():
+            return None, "aborted"
+
+        if not raw_results:
+            return None, "no_results"
+
+        self._cache.set(cache_key, raw_results, settings.cache_ttl)
+        return raw_results, None
+
+    def _format_tavily_results(self, raw_results):
+        all_results = []
+        for r in raw_results:
+            if len(all_results) >= _MAX_TOTAL_RESULTS:
+                break
+            ref_id = self._next_ref_id("tavily")
+            self._registry.register(ref_id, {
+                "source_id": "tavily",
+                "fetch_info": r.get("fetch_info") or {"kind": "tavily_url", "url": r.get("url", "")},
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+            })
+            all_results.append({
+                "ref_id": ref_id,
+                "source_name": "Tavily",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "snippet": _strip_html(r.get("snippet", "")),
+            })
+        return {"ok": True, "results": all_results, "failed_sources": []}
 
     # ---------- 正文读取 ----------
     def read_article(self, identifier):
@@ -646,7 +751,33 @@ class WebSearchEngine:
         # 1) 内部引用 ID
         info = self._registry.resolve(identifier)
         if info is not None:
-            adapter = self._adapter_for(info.get("source_id"))
+            source_id = info.get("source_id")
+
+            # ===== Step 3: Tavily 分支，跳过白名单与 _adapter_for =====
+            if source_id == "tavily":
+                adapter = TavilyAdapter()
+                try:
+                    text = adapter.fetch_article(info.get("fetch_info") or {}, max_chars)
+                except Exception as e:
+                    print(f"[WebSearch] Tavily 正文读取异常: {e}")
+                    text = None
+                if not text:
+                    return {
+                        "ok": False,
+                        "error_type": "fetch_failed",
+                        "error": "Tavily 正文抓取失败（可能触发限流或页面不可提取）。",
+                        "next_action": "依据搜索摘要作答，不要重复重试。",
+                    }
+                return {
+                    "ok": True,
+                    "title": info.get("title", ""),
+                    "url": info.get("url", ""),
+                    "source_name": "Tavily",
+                    "text": text,
+                }
+
+            # ===== 通用 sources 分支 =====
+            adapter = self._adapter_for(source_id)
             if adapter is None:
                 return {
                     "ok": False,
@@ -690,7 +821,7 @@ class WebSearchEngine:
                 "source_name": adapter.display_name,
                 "text": text,
             }
-        
+
         # 2) 直接 URL
         if identifier.startswith("http://") or identifier.startswith("https://"):
             if not self._url_allowed(identifier):
@@ -723,7 +854,7 @@ class WebSearchEngine:
             "ok": False,
             "error_type": "unknown_identifier",
             "error": f"无法识别的标识符：{identifier}",
-            "next_action": "请使用 web_search 结果中的 ID（如 wiki_zh_3），或完整的 http/https 链接。",
+            "next_action": "请使用 web_search 结果中的 ID（如 tavily_1），或完整的 http/https 链接。",
         }
 
     # ---------- 内部 ----------
@@ -790,6 +921,7 @@ def format_search_results(results, failed_sources=None):
     )
     return "\n".join(lines)
 
+
 # ==================== 单例入口 ====================
 
 _engine_instance = None
@@ -812,25 +944,3 @@ def run_web_search(query, max_results=None, aborted=None):
 def run_read_article(identifier):
     return get_search_engine().read_article(identifier)
 
-
-# ==================== 独立自测 ====================
-
-if __name__ == "__main__":
-    import sys as _sys
-    q = " ".join(_sys.argv[1:]) or "Live2D"
-    settings = InternetSettings.get_instance()
-    print(f"代理: {settings.proxy or '（直连）'}")
-    print(f"启用来源: {settings.enabled_source_names()}")
-    print("=" * 50)
-    res = run_web_search(q)
-    print(json.dumps(res, ensure_ascii=False, indent=2)[:2000])
-    if res.get("ok") and res.get("results"):
-        first_ref = res["results"][0]["ref_id"]
-        print("=" * 50)
-        print(f"读取正文: {first_ref}")
-        art = run_read_article(first_ref)
-        if art.get("ok"):
-            print(f"标题: {art['title']}\n来源: {art['source_name']}")
-            print(art["text"][:500])
-        else:
-            print(json.dumps(art, ensure_ascii=False))
