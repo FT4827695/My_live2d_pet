@@ -1,6 +1,10 @@
 import os
+import sys
 import re
 import io
+import json
+import ast
+import subprocess
 import contextlib
 import pandas as pd
 import win32clipboard as wc
@@ -16,6 +20,41 @@ from response_stats import ResponseStats, estimate_text_tokens, estimate_message
 
 ASSISTANT_NAME = get_character_name()
 ASSISTANT_PREFIX = ASSISTANT_NAME + ": "
+
+
+# ================== 0. 代码执行安全预检 =================
+
+_PANDAS_IO_BLOCKLIST = {
+    "read_csv", "read_json", "read_html", "read_fwf",
+    "read_clipboard", "read_table", "read_xml", "read_sql",
+    "to_csv", "to_json", "to_pickle", "to_xml",
+}
+
+
+class _PandasIOVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.violations = []
+
+    def visit_Call(self, node):
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _PANDAS_IO_BLOCKLIST:
+            if isinstance(func.value, ast.Name) and func.value.id in (
+                "pd", "df", "df1", "df2", "dfs"
+            ):
+                if node.args:
+                    arg0 = node.args[0]
+                    if not isinstance(arg0, ast.Constant):
+                        self.violations.append(
+                            f"第 {node.lineno} 行：{func.attr} 的第一个参数不是字面量，"
+                            f"禁止动态构造路径/URL。"
+                        )
+                    elif isinstance(arg0.value, str):
+                        v = arg0.value
+                        if "://" in v or (len(v) >= 2 and v[1] == ":"):
+                            self.violations.append(
+                                f"第 {node.lineno} 行：{func.attr} 不允许接收 URL 或绝对路径。"
+                            )
+        self.generic_visit(node)
 
 
 # ================== 1. 剪贴板服务 =================
@@ -151,7 +190,12 @@ class TextUtils:
         pattern_block = re.compile(r'\$\$([\s\S]*?)\$\$', re.DOTALL)
         return pattern_block.sub(r'\1', text)
 
+
 # ================== 3. 统一代码执行引擎 =================
+
+_SANDBOX_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_runner.py")
+
+
 class CodeExecutor:
 
     @staticmethod
@@ -181,131 +225,97 @@ class CodeExecutor:
         df: pd.DataFrame = None,
         dfs: list = None
     ):
+        # ===== 1. 数据预处理 =====
         if df is not None:
             df = df.copy(deep=True)
             df.columns = [str(c) for c in df.columns]
-            
+
         if dfs is not None:
             dfs = [d.copy(deep=True) if d is not None else None for d in dfs]
             for d in dfs:
                 if d is not None:
                     d.columns = [str(c) for c in d.columns]
 
-        # ===== 自动移除白名单内的 import 语句 =====
+        # ===== 2. 剥离白名单内的 import 语句（前置清理） =====
         allowed_imports = r'(pandas|numpy|math|re|json|datetime|collections|itertools|statistics)'
         code_str = re.sub(rf'^\s*import\s+{allowed_imports}\b.*$', '', code_str, flags=re.MULTILINE)
         code_str = re.sub(rf'^\s*from\s+{allowed_imports}\s+import\b.*$', '', code_str, flags=re.MULTILINE)
-        
+
+        # ===== 3. regex 第一道过滤 =====
+        if re.search(r'read_excel|read_csv|open\(|load\s*\(|from\s+file', code_str):
+            return False, "代码中禁止读取外部文件，直接使用已有的 df 或 dfs 变量。", None
+
+        # ===== 4. AST 预检 =====
         try:
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                if re.search(r'read_excel|read_csv|open\(|load\s*\(|from\s+file', code_str):
-                    return False, "代码中禁止读取外部文件，直接使用已有的 df 或 dfs 变量。", None
-                compile(code_str, '<string>', 'exec')
+            tree = ast.parse(code_str)
         except SyntaxError as e:
             return False, f"代码语法错误: {e}", None
 
-        import builtins
-        _original_import = builtins.__import__
+        visitor = _PandasIOVisitor()
+        visitor.visit(tree)
+        if visitor.violations:
+            return False, "代码包含被禁止的 I/O 操作：\n" + "\n".join(visitor.violations), None
 
-        def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-            allowed_modules = {
-                'pandas', 'numpy', 'math', 're', 'json',
-                'datetime', 'collections', 'itertools', 'statistics'
-            }
-            if name.split('.')[0] in allowed_modules:
-                return _original_import(name, globals, locals, fromlist, level)
-            raise ImportError(f"禁止导入非白名单模块: {name}")
-
-        safe_builtins = {
-            'len': len, 'range': range, 'print': print,
-            'str': str, 'int': int, 'float': float,
-            'list': list, 'dict': dict, 'tuple': tuple,
-            'set': set, 'sum': sum, 'max': max, 'min': min,
-            'abs': abs, 'round': round, 'enumerate': enumerate,
-            'zip': zip, 'map': map, 'filter': filter,
-            '__import__': _safe_import
+        # ===== 5. 序列化数据并调用子进程 =====
+        payload = {
+            "code": code_str,
+            "df": df.to_dict(orient="split") if df is not None else None,
+            "dfs": [d.to_dict(orient="split") if d is not None else None for d in dfs] if dfs else None,
         }
 
-        import re as _re
-        import json as _json
-        import datetime as _datetime
-        import collections as _collections
-        import itertools as _itertools
-        import statistics as _statistics
-        
-        namespace = {
-            'pd': pd, 'np': np, 'math': math,
-            're': _re,
-            'json': _json,
-            'datetime': _datetime,
-            'collections': _collections,
-            'itertools': _itertools,
-            'statistics': _statistics,
-            'df': df, 'dfs': dfs, 'result': None,
-            '__builtins__': safe_builtins
-        }
-        
-        if dfs:
-            for i, d in enumerate(dfs):
-                namespace[f'df{i + 1}'] = d
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
 
         try:
-            n_ctx = int(os.environ.get("XLLAMA_CTX", 8192))
-            max_chars = int(n_ctx * 0.6 * 1.8)
-        except Exception:
-            max_chars = 8000
-
-        import ast
-        code_str_to_exec = code_str
-        try:
-            tree = ast.parse(code_str)
-            if tree.body and isinstance(tree.body[-1], ast.Expr):
-                last_expr = tree.body[-1].value
-                new_node = ast.Assign(
-                    targets=[ast.Name(id='result', ctx=ast.Store())],
-                    value=last_expr
+            proc = subprocess.Popen(
+                [sys.executable, _SANDBOX_RUNNER],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env=env, 
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+            try:
+                stdout, stderr = proc.communicate(
+                    json.dumps(payload, ensure_ascii=False),
+                    timeout=600,
                 )
-                tree.body[-1] = new_node
-                ast.fix_missing_locations(tree)
-                code_str_to_exec = ast.unparse(tree)
-        except Exception:
-            pass
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.call(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    proc.kill()
+                proc.communicate()
+                return False, "代码执行超时（超过600秒），子进程已终止。", None
+        except Exception as e:
+            return False, f"子进程启动失败: {e}", None
 
-        # 执行与超时机制（600秒超时）
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-        
-        def _run_exec():
-            f = io.StringIO()
-            with contextlib.redirect_stdout(f):
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", SyntaxWarning)
-                    exec(code_str_to_exec, namespace)
-            return f.getvalue().strip()
+        if not stdout.strip():
+            return False, f"子进程无输出。stderr: {stderr[:2000]}", None
+        if not stdout.strip():
+            return False, f"子进程无有效输出。stderr: {(stderr or '')[:2000]}", None
 
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_run_exec)
-                output = future.result(timeout=600)
-                
-        except FuturesTimeoutError:
-            return False, "代码执行超时（超过600秒），可能存在死循环或计算量过大。", None
-        except Exception:
-            import traceback
-            err_msg = traceback.format_exc()
-            if len(err_msg) > max_chars:
-                err_msg = err_msg[:max_chars // 2] + "\n...\n[报错信息过长已截断]\n...\n" + err_msg[-max_chars // 2:]
-            return False, f"代码执行错误:\n{err_msg}", None
+            res = json.loads(stdout)
+        except json.JSONDecodeError:
+            return False, f"子进程返回非 JSON 内容: {stdout[:2000]}", None
 
-        result = namespace.get('result')
-        if result is not None:
-            result = CodeExecutor._convert_numpy_types(result)
+        if not res.get("success"):
+            return False, res.get("output", "子进程执行失败"), None
+
+        result = res.get("result")
+        output = res.get("output", "")
 
         if output:
             return True, output, result
-            
+
         if result is not None:
             if isinstance(result, pd.DataFrame):
                 display = result.to_csv(index=False)
@@ -314,8 +324,9 @@ class CodeExecutor:
             else:
                 display = str(result)
             return True, display, result
-            
+
         return False, "代码执行成功但没有输出。务必在代码末尾使用 `result = ...` 或 `print(...)` 来输出结果。", None
+
 
 # ================== 4. 消息处理中枢 =================
 class MessageProcessor:
@@ -466,7 +477,7 @@ class MessageProcessor:
                 base_label = meta.get("spoken_label") or "文档"
                 if "扫描" not in base_label:
                     meta["spoken_label"] = f"{base_label}（含扫描页）"
-                
+
             ttl = att.get("ttl_turns", 30)
 
             if normalized_type == "excel":
@@ -544,7 +555,6 @@ class MessageProcessor:
             get_legacy_code_agent_system_prompt,
         )
         # ===== 联网搜索开关与白名单来源 =====
-        # Step 4：Tavily 作为主通道，sources 作为兜底；两者任一可用即放行 web_search 工具
         web_search_enabled = False
         web_search_source_names = ""
         if supports_fc:
@@ -568,7 +578,7 @@ class MessageProcessor:
             system_prompt = get_legacy_code_agent_system_prompt(
                 thinking_mode=thinking_mode
             )
-        
+
         # ===== index_hint =====
         index_hint = ""
 
@@ -657,7 +667,7 @@ class MessageProcessor:
                             desc = (
                                 f"- 文件{file_no}（{spoken_label}）[不可用]："
                                 f"当前视觉模块不可用，禁止声称能看到图片。"
-                        )
+                            )
                         else:
                             desc = (
                                 f"- 文件{file_no}（{spoken_label}）[未注入]："
@@ -667,7 +677,7 @@ class MessageProcessor:
                             )
 
                         raw_desc_items.append((is_focus, desc))
-        
+
             total_excel = len(excel_entries)
 
             if supports_fc:
@@ -804,7 +814,7 @@ class MessageProcessor:
                 stats=stats,
                 image_paths=[],
             )
-            
+
         # ============ 防幻觉拦截  ============
         if (supports_fc and not used_fc and web_search_enabled
                 and final_reply and isinstance(final_reply, str)):
@@ -841,7 +851,7 @@ class MessageProcessor:
                 if retry_reply and retry_used_fc:
                     final_reply = retry_reply
                     used_fc = True
-            
+
         # ==================================================
 
         fail_code = self._detect_reply_failure(final_reply)

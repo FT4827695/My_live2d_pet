@@ -35,22 +35,20 @@ _DEFAULT_SETTINGS = {
             "display_name": "Bing新闻"
         },
         {
-            "id": "baidu_baike",
-            "type": "site_search",
+            "id": "baidu",
+            "type": "baidu_search",
             "enabled": True,
             "display_name": "百度",
             "target_domain": "www.baidu.com",
-            "use_site_operator": False,
             "no_body": False
         },
         {
             "id": "sogou",
-            "type": "site_search",
+            "type": "sogou_search",
             "enabled": True,
             "display_name": "搜狗",
             "target_domain": "www.sogou.com",
-            "use_site_operator": False,
-            "no_body": True
+            "no_body": False
         }
     ]
 }
@@ -178,11 +176,11 @@ class InternetSettings:
     _TYPE_LABELS = {
         "site_search": "通用",
         "news_search": "资讯",
+        "baidu_search": "通用",
+        "sogou_search": "通用",
     }
 
     def enabled_source_names(self) -> str:
-        """把当前生效的搜索来源汇总成一行，供工具描述使用。
-        Tavily 作为主通道固定在前，sources 兜底源按配置顺序追加。"""
         names = []
         if self.tavily_enabled:
             names.append("Tavily[AI]")

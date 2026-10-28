@@ -13,8 +13,11 @@ import base64
 
 import requests
 import html
+import random
 
 from internet_settings import InternetSettings
+from ssrfguard import Policy
+from ssrfguard.requests import Session as GuardedSession
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -147,7 +150,7 @@ class BaseSourceAdapter:
 
     def _session(self):
         settings = InternetSettings.get_instance()
-        s = requests.Session()
+        s = GuardedSession(policy=Policy())
         s.headers.update({"User-Agent": _USER_AGENT})
         proxies = settings.proxies
         if proxies:
@@ -371,7 +374,10 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
             return None
         session = self._session()
         try:
-            resp = session.get(url, timeout=self._timeout())
+            resp = session.get(url, timeout=self._timeout(), allow_redirects=False)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                print(f"[WebSearch] 目标返回重定向 ({resp.status_code})，未经验证的目标不跟随")
+                return None
             if resp.status_code != 200:
                 return None
             if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
@@ -381,7 +387,10 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
                 return None
             return text
         except Exception as e:
-            print(f"[WebSearch] 网页抓取失败 {url}: {e}")
+            if "ssrf" in type(e).__name__.lower() or "blocked" in str(e).lower():
+                print(f"[WebSearch] SSRF 拦截: {e}")
+            else:
+                print(f"[WebSearch] 网页抓取失败 {url}: {e}")
             return None
         finally:
             session.close()
@@ -479,6 +488,173 @@ class BingNewsAdapter(BaseSourceAdapter):
         return BingSiteSearchAdapter(self.config).fetch_article(info, max_chars)
 
 
+# ==================== 百度直搜适配器 ====================
+
+class BaiduSearchAdapter(BaseSourceAdapter):
+    source_type = "baidu_search"
+    SEARCH_URL = "https://www.baidu.com/s"
+
+    def search(self, query, max_results):
+        session = self._session()
+        session.headers.update({
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.baidu.com/",
+        })
+        try:
+            resp = session.get(
+                self.SEARCH_URL,
+                params={"wd": query, "rn": max_results},
+                timeout=self._timeout(),
+                allow_redirects=False,
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise SearchSourceError(f"重定向({resp.status_code})")
+            if resp.status_code != 200:
+                raise SearchSourceError(f"HTTP {resp.status_code}")
+            if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+                resp.encoding = resp.apparent_encoding
+            return self._parse_results(resp.text, max_results)
+        except SearchSourceError:
+            raise
+        except Exception as e:
+            raise SearchSourceError(f"请求失败: {e}")
+        finally:
+            session.close()
+
+    def _parse_results(self, html, max_results):
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            raise SearchSourceError("缺少依赖 beautifulsoup4")
+
+        # 反爬/验证页特征
+        if ("百度安全验证" in html
+                or "wappass.baidu.com" in html
+                or "security.baidu.com" in html):
+            raise SearchSourceError("触发百度安全验证")
+
+        soup = BeautifulSoup(html, "html.parser")
+        results = []
+        for container in soup.select("div.result, div.c-container, div.result-op"):
+            h3 = container.find("h3")
+            if not h3:
+                continue
+            a = h3.find("a")
+            if not a or not a.get("href"):
+                continue
+            href = str(a["href"]).strip()
+            if not href.startswith(("http://", "https://")):
+                from urllib.parse import urljoin
+                href = urljoin("https://www.baidu.com", href)
+            snippet_el = container.select_one(
+                "div.c-abstract, span.content-right_1THTn, div.c-span-last"
+            )
+            title = h3.get_text(strip=True)
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            if not title:
+                continue
+            results.append({
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+                "fetch_info": {"kind": "generic_url", "url": href},
+            })
+            if len(results) >= max_results:
+                break
+
+        if not results:
+            raise SearchSourceError("未解析到结果")
+        return results
+
+    def fetch_article(self, info, max_chars):
+        return BingSiteSearchAdapter(self.config).fetch_article(info, max_chars)
+
+
+# ==================== 搜狗直搜适配器 ====================
+
+class SogouSearchAdapter(BaseSourceAdapter):
+    source_type = "sogou_search"
+    SEARCH_URL = "https://www.sogou.com/web"
+
+    def search(self, query, max_results):
+        session = self._session()
+        ua = _USER_AGENT
+        if "Edg/" in ua:
+            ua = ua.split(" Edg/")[0].rstrip() + " Safari/537.36"
+        session.headers.update({
+            "User-Agent": ua,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.sogou.com/",
+        })
+        try:
+            resp = session.get(
+                self.SEARCH_URL,
+                params={"query": query, "num": max_results},
+                timeout=self._timeout(),
+                allow_redirects=False,
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise SearchSourceError(f"重定向({resp.status_code})")
+            if resp.status_code != 200:
+                raise SearchSourceError(f"HTTP {resp.status_code}")
+            if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+                resp.encoding = resp.apparent_encoding
+            return self._parse_results(resp.text, max_results)
+        except SearchSourceError:
+            raise
+        except Exception as e:
+            raise SearchSourceError(f"请求失败: {e}")
+        finally:
+            session.close()
+
+    def _parse_results(self, html, max_results):
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            raise SearchSourceError("缺少依赖 beautifulsoup4")
+
+        if ("请输入验证码" in html
+                or "antispider" in html
+                or "checkcode" in html):
+            raise SearchSourceError("触发搜狗反爬验证")
+
+        soup = BeautifulSoup(html, "html.parser")
+        results = []
+        for container in soup.select("div.vrwrap, div.rb, li.result"):
+            h3 = container.find("h3")
+            if not h3:
+                continue
+            a = h3.find("a")
+            if not a or not a.get("href"):
+                continue
+            href = str(a["href"]).strip()
+            if href.startswith("/"):
+                href = "https://www.sogou.com" + href
+            snippet_el = container.select_one(
+                "div.str-text-info, div.ft, div.text-layout"
+            )
+            title = h3.get_text(strip=True)
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            if not title:
+                continue
+            results.append({
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+                "fetch_info": {"kind": "generic_url", "url": href},
+            })
+            if len(results) >= max_results:
+                break
+
+        if not results:
+            raise SearchSourceError("未解析到结果")
+        return results
+
+    def fetch_article(self, info, max_chars):
+        return BingSiteSearchAdapter(self.config).fetch_article(info, max_chars)
+
 def _extract_page_text(html, max_chars):
     try:
         from bs4 import BeautifulSoup
@@ -520,8 +696,9 @@ def _extract_page_text(html, max_chars):
 _ADAPTER_CLASSES = {
     "site_search": BingSiteSearchAdapter,
     "news_search": BingNewsAdapter,
+    "baidu_search": BaiduSearchAdapter,
+    "sogou_search": SogouSearchAdapter,
 }
-
 
 def _build_adapter(source_config):
     cls = _ADAPTER_CLASSES.get(str(source_config.get("type", "")))
@@ -538,6 +715,7 @@ class WebSearchEngine:
         self._registry = _ResultRegistry()
         self._ref_counter = 0
         self._lock = threading.Lock()
+        self._last_source_request_ts = 0.0
 
     def _next_ref_id(self, source_id):
         with self._lock:
@@ -626,17 +804,28 @@ class WebSearchEngine:
             if cached is not None:
                 results = cached
             else:
-                try:
-                    results = adapter.search(query, per_source)
-                except SearchSourceError as e:
-                    failed_sources.append(f"{adapter.display_name}（{e}）")
-                    continue
-                except Exception as e:
-                    print(f"[WebSearch] {adapter.display_name} 搜索异常: {e}")
-                    failed_sources.append(f"{adapter.display_name}（搜索异常）")
-                    continue
-                if results:
-                    self._cache.set(cache_key, results, settings.cache_ttl)
+                if self._last_source_request_ts > 0:
+                    elapsed = time.time() - self._last_source_request_ts
+                    wait_target = random.uniform(3.0, 5.0)
+                    if elapsed < wait_target:
+                        sleep_sec = wait_target - elapsed
+                        if aborted is not None and aborted():
+                            break
+                        time.sleep(sleep_sec)
+                    try:
+                        results = adapter.search(query, per_source)
+                        self._last_source_request_ts = time.time()
+                    except SearchSourceError as e:
+                        self._last_source_request_ts = time.time()
+                        failed_sources.append(f"{adapter.display_name}（{e}）")
+                        continue
+                    except Exception as e:
+                        self._last_source_request_ts = time.time()
+                        print(f"[WebSearch] {adapter.display_name} 搜索异常: {e}")
+                        failed_sources.append(f"{adapter.display_name}（搜索异常）")
+                        continue
+                    if results:
+                        self._cache.set(cache_key, results, settings.cache_ttl)
             for r in results:
                 if len(all_results) >= _MAX_TOTAL_RESULTS:
                     break
@@ -681,12 +870,6 @@ class WebSearchEngine:
 
     # ---------- Tavily 封装 ----------
     def _search_via_tavily(self, query, per_source, aborted):
-        """
-        返回 (raw_results, fail_reason)。
-          - 成功且至少 1 条：raw_results 非空，fail_reason 为 None
-          - 失败：raw_results 为 None，fail_reason 为
-            "rate_limited" / "unavailable" / "no_results" / "aborted" / "exception"
-        """
         settings = InternetSettings.get_instance()
 
         cache_key = ("tavily", _normalize_query(query))

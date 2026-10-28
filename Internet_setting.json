@@ -1,5 +1,5 @@
 {
-    "web_search_enabled": true,
+    "web_search_enabled": false,
     "proxy": "",
     "request_timeout_sec": 15,
     "max_results_per_source": 3,
@@ -17,22 +17,20 @@
             "display_name": "Bing新闻"
         },
         {
-            "id": "baidu_baike",
-            "type": "site_search",
+            "id": "baidu",
+            "type": "baidu_search",
             "enabled": true,
             "display_name": "百度",
             "target_domain": "www.baidu.com",
-            "use_site_operator": false,
             "no_body": false
         },
         {
             "id": "sogou",
-            "type": "site_search",
+            "type": "sogou_search",
             "enabled": true,
             "display_name": "搜狗",
             "target_domain": "www.sogou.com",
-            "use_site_operator": false,
-            "no_body": true
+            "no_body": false
         }
     ]
 }
