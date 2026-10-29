@@ -343,17 +343,17 @@ class CodeExecutor:
                 payload_text,
                 timeout=600,
             )
-            except subprocess.TimeoutExpired:
-                if os.name == "nt":
-                    subprocess.call(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                else:
-                    proc.kill()
-                proc.communicate()
-                return False, "代码执行超时（超过600秒），子进程已终止。", None
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                subprocess.call(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc.kill()
+            proc.communicate()
+            return False, "代码执行超时（超过600秒），子进程已终止。", None
         except Exception as e:
             return False, f"子进程启动失败: {e}", None
 

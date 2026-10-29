@@ -1013,6 +1013,17 @@ class WebSearchEngine:
                         "error": f"该搜索结果链接不可读取：{reason}。",
                        "next_action": "仅依据搜索摘要作答；如需读取，请在该来源配置中添加 fetch_domains。",
                     }
+
+            # --- 拦截 JS 动态渲染的金融/实时数据页面 ---
+            target_url = info.get("url", "")
+            if re.search(r'(gu\.qq\.com|finance\.sina\.com\.cn|quote\.eastmoney\.com|xueqiu\.com)', target_url):
+                return {
+                    "ok": False,
+                    "error_type": "dynamic_page_blocked",
+                   "error": "该页面为 JavaScript 动态渲染的实时数据页面，当前文本抓取工具无法提取其中的实时数字。",
+                    "next_action": "请直接依据搜索结果摘要（Snippet）作答。",
+                }
+            # ----------------------------------------------
             
             target_domain = str(adapter.config.get("target_domain", "")).strip().lower()
             result_host = _host_of(info.get("url", ""))

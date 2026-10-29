@@ -56,9 +56,9 @@ _DEFAULT_SETTINGS = {
 class InternetSettings:
     _instance = None
     _lock = threading.Lock()
-    self._io_lock = threading.RLock()
 
     def __init__(self):
+        self._io_lock = threading.RLock()
         self._data = {}
         self._load()
 
@@ -97,13 +97,13 @@ class InternetSettings:
 
     def _save(self):
         with self._io_lock:
-        try:
-            tmp_path = _INTERNET_SETTING_PATH + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=4)
-            os.replace(tmp_path, _INTERNET_SETTING_PATH)
-        except Exception as e:
-            print(f"[InternetSettings] 保存配置失败: {e}")
+            try:
+                tmp_path = _INTERNET_SETTING_PATH + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(self._data, f, ensure_ascii=False, indent=4)
+                os.replace(tmp_path, _INTERNET_SETTING_PATH)
+            except Exception as e:
+                print(f"[InternetSettings] 保存配置失败: {e}")
         
 
     # ---------- 读接口 ----------

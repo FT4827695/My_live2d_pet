@@ -602,9 +602,7 @@ class ToolLoopDriver:
                             res = self._run_read_web_article(args)
                             structured_result.update(res)
                             if not structured_result.get("ok"):
-                                "next_action",
-                                "请依据已有搜索摘要作答，不要重复读取正文。"
-                                )
+                                structured_result["next_action"] = "请依据已有搜索摘要作答，不要重复读取正文。"
 
                         else:
                             structured_result["error_type"] = "unknown_tool"
