@@ -87,6 +87,7 @@ class InputHandler:
         glfw.set_key_callback(self._window, self._key_callback)
         glfw.set_char_callback(self._window, self._char_callback)
         glfw.set_scroll_callback(self._window, self._scroll_callback)
+        glfw.set_drop_callback(self._window, self._drop_callback)
 
     # ==================== 状态 ====================
     @property
@@ -144,6 +145,43 @@ class InputHandler:
         except Exception:
             pass
 
+    def _drop_callback(self, window, paths):
+        if not self._get_active():
+            return
+        if not paths:
+            return
+
+        mx, my = glfw.get_cursor_pos(window)
+        rx, ry = int(mx), int(my)
+        if not (
+            self._input_x <= rx <= self._input_x + self._input_w
+            and self._input_top <= ry <= self._input_bottom
+        ):
+            return
+
+        self._handle_upload_paths(list(paths))
+        
+    def _handle_upload_paths(self, paths):
+        ctx = self._build_context()
+        uploader = getattr(ctx, "doc_uploader", None)
+        if uploader is None:
+            return
+
+        result = uploader.start_upload_paths(paths)
+        if result and result.get("dirs"):
+            self._notify_user("暂不支持文件夹")
+
+        self._request_update()
+        self._mark_dirty()
+
+    def _notify_user(self, text):
+        try:
+            if hasattr(self._chat_ctrl, "notify_user") and self._chat_ctrl.notify_user(text):
+                return
+        except Exception as e:
+            print(f"[InputHandler] notify_user 异常: {e}")
+        print(f"[InputHandler] {text}")
+        
     # ==================== 鼠标 ====================
     def _mouse_callback(self, win, button, action, mods):
         if not self._get_active():
@@ -612,16 +650,24 @@ class InputHandler:
                 return
             self._hide_window()
             return
+        
         # Ctrl+V 粘贴
         if key == glfw.KEY_V and (mods & glfw.MOD_CONTROL):
             if not self._get_input_focus():
                 return
+
+            files = ClipboardService.get_files()
+            if files:
+                self._handle_upload_paths(files)
+                return
+
             text = ClipboardService.get_text()
             if text:
                 self._input_box.paste(text)
                 self._request_update()
                 self._mark_dirty()
             return
+        
         # Ctrl+C 复制
         if key == glfw.KEY_C and (mods & glfw.MOD_CONTROL):
             # 1. 输入框选区

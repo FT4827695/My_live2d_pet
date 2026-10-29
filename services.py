@@ -80,6 +80,21 @@ class ClipboardService:
         except Exception:
             pass
 
+    @staticmethod
+    def get_files() -> list:
+        try:
+            if not wc.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                return []
+            wc.OpenClipboard()
+            try:
+                data = wc.GetClipboardData(win32con.CF_HDROP)
+            finally:
+                wc.CloseClipboard()
+            if not data:
+                return []
+            return [str(p) for p in data if p]
+        except Exception:
+            return []
 
 # ================== 2. 文本工具 =================
 class TextUtils:

@@ -58,6 +58,11 @@ class DocsUploader:
         self._preprocessing = False
         self._preprocess_start_time = None
 
+        # 拖拽 / 粘贴文件排队
+        self._pending_batches = queue.Queue()
+        self._drain_lock = threading.RLock()
+        self._drain_thread = None
+
     def _default_font(self, size):
         from PIL import ImageFont
         try:
@@ -69,6 +74,8 @@ class DocsUploader:
 
     def select_file_async(self):
         if self._thread and self._thread.is_alive():
+            return
+        if self._preprocessing:
             return
         self._result_queue = queue.Queue()
         self._thread = threading.Thread(target=self._file_dialog_thread, daemon=True)
@@ -113,6 +120,69 @@ class DocsUploader:
             self._preprocessing = False
             self._preprocess_start_time = None
             self._result_queue.put(None)
+
+    def start_upload_paths(self, paths):
+        paths = list(paths or [])
+        files = []
+        dirs = []
+        for p in paths:
+            if os.path.isdir(p):
+                dirs.append(p)
+            elif os.path.isfile(p):
+                files.append(p)
+
+        if files:
+            self._pending_batches.put(files)
+            self._ensure_drain_thread()
+
+        return {"accepted": len(files), "dirs": dirs}
+    
+    def _ensure_drain_thread(self):
+        with self._drain_lock:
+            if self._drain_thread is not None and self._drain_thread.is_alive():
+                return
+            if self._pending_batches.empty():
+                return
+            self._drain_thread = threading.Thread(
+                target=self._drain_pending_batches, daemon=True
+            )
+            self._drain_thread.start()
+
+    def _drain_pending_batches(self):
+        try:
+            self._preprocessing = True
+            self._preprocess_start_time = time.time()
+
+            while True:
+                try:
+                    paths = self._pending_batches.get_nowait()
+                except queue.Empty:
+                    break
+
+                try:
+                    results = [self._process_single_file(p) for p in paths]
+                except Exception as e:
+                    print(f"[DocsUploader] 批次处理异常: {e}")
+                    results = [
+                        {
+                            "error": True,
+                            "reason_code": "preprocess_error",
+                            "reason": f"批次处理异常: {e}",
+                            "path": p,
+                        }
+                        for p in paths
+                    ]
+
+                self._result_queue.put(results)
+        except Exception as e:
+            print(f"[DocsUploader] 排队处理异常: {e}")
+        finally:
+            self._preprocessing = False
+            self._preprocess_start_time = None
+            with self._drain_lock:
+                self._drain_thread = None
+            if not self._pending_batches.empty():
+                self._ensure_drain_thread()            
 
     def _get_selected_paths(self, dlg):
         try:

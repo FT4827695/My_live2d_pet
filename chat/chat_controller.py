@@ -32,6 +32,30 @@ class ChatController:
                 if getattr(processor, "uploader", None) is None:
                     processor.uploader = uploader
 
+    def notify_user(self, text):
+        pet = getattr(self.vm, "pet", None)
+        if pet is None:
+            return False
+
+        delivered = False
+
+        chat_window = getattr(pet, "chat_window", None)
+        if chat_window is not None and getattr(chat_window, "active", False):
+            try:
+                chat_window.add_message("shizuku", text)
+                delivered = True
+            except Exception as e:
+                print(f"[ChatController] notify_user 写聊天窗口失败: {e}")
+
+        try:
+            if hasattr(pet, "queue_bubble"):
+                pet.queue_bubble(text)
+                delivered = True
+        except Exception as e:
+            print(f"[ChatController] notify_user queue_bubble 失败: {e}")
+
+        return delivered
+    
     # ==================== 消息管理 ====================
 
     def add_message(self, sender, text):
