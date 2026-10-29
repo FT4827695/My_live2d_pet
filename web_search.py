@@ -1219,7 +1219,7 @@ def format_search_results(results, failed_sources=None):
         return "未获得搜索结果。"
     settings = InternetSettings.get_instance()
     budget = settings.max_snippet_chars
-    per_limit = max(120, budget // len(results))
+    per_limit = max(384, budget // len(results))
     lines = []
     for i, r in enumerate(results, 1):
         snippet = (r.get("snippet") or "").strip()
