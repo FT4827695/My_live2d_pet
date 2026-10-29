@@ -598,6 +598,14 @@ class ToolLoopDriver:
                                         "可更换关键词重试一次，仍失败则如实告知用户。"
                                     )
 
+                        elif func_name == "read_web_article":
+                            res = self._run_read_web_article(args)
+                            structured_result.update(res)
+                            if not structured_result.get("ok"):
+                                "next_action",
+                                "请依据已有搜索摘要作答，不要重复读取正文。"
+                                )
+
                         else:
                             structured_result["error_type"] = "unknown_tool"
                             structured_result["error"] = f"未知工具：{func_name}"

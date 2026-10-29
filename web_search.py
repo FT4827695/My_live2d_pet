@@ -60,7 +60,10 @@ def _truncate(text, max_chars):
 
 
 def _normalize_query(query):
-    return re.sub(r"\s+", " ", str(query or "").strip().lower())
+    q = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    q = q.replace("“", '"').replace("”", '"')
+    q = q.replace("‘", "'").replace("’", "'")
+    return q
 
 
 def _host_of(url):
@@ -804,28 +807,24 @@ class WebSearchEngine:
             if cached is not None:
                 results = cached
             else:
-                if self._last_source_request_ts > 0:
-                    elapsed = time.time() - self._last_source_request_ts
-                    wait_target = random.uniform(3.0, 5.0)
-                    if elapsed < wait_target:
-                        sleep_sec = wait_target - elapsed
-                        if aborted is not None and aborted():
-                            break
-                        time.sleep(sleep_sec)
-                    try:
-                        results = adapter.search(query, per_source)
-                        self._last_source_request_ts = time.time()
-                    except SearchSourceError as e:
-                        self._last_source_request_ts = time.time()
-                        failed_sources.append(f"{adapter.display_name}（{e}）")
-                        continue
-                    except Exception as e:
-                        self._last_source_request_ts = time.time()
-                        print(f"[WebSearch] {adapter.display_name} 搜索异常: {e}")
-                        failed_sources.append(f"{adapter.display_name}（搜索异常）")
-                        continue
-                    if results:
-                        self._cache.set(cache_key, results, settings.cache_ttl)
+                self._wait_before_source_request(adapter, aborted)
+
+                try:
+                    results = adapter.search(query, per_source)
+                    self._last_source_request_ts = time.time()
+                except SearchSourceError as e:
+                    self._last_source_request_ts = time.time()
+                    failed_sources.append(f"{adapter.display_name}（{e}）")
+                    continue
+                except Exception as e:
+                    self._last_source_request_ts = time.time()
+                    print(f"[WebSearch] {adapter.display_name} 搜索异常: {e}")
+                    failed_sources.append(f"{adapter.display_name}（搜索异常）")
+                    continue
+
+                if results:
+                    self._cache.set(cache_key, results, settings.cache_ttl)
+        
             for r in results:
                 if len(all_results) >= _MAX_TOTAL_RESULTS:
                     break
@@ -968,6 +967,53 @@ class WebSearchEngine:
                     "error": "该引用 ID 对应的来源当前未启用。",
                     "next_action": "请重新调用 web_search 获取新的结果列表。",
                 }
+
+            fetch_url = str(
+                info.get("url")
+                or (info.get("fetch_info") or {}).get("url")
+                or ""
+            ).strip()
+
+            if not fetch_url:
+                return {
+                    "ok": False,
+                    "error_type": "missing_url",
+                    "error": "该搜索结果没有可读取的链接。",
+                    "next_action": "依据搜索摘要作答，不要重复重试。",
+                }
+
+            ok, reason = self._can_fetch_url(
+                fetch_url,
+                adapter.config,
+                allow_search_result=True
+            )
+            if not ok:
+                return {
+                    "ok": False,
+                    "error_type": "url_not_allowed",
+                    "error": f"该搜索结果链接不可读取：{reason}。",
+                    "next_action": "仅依据搜索摘要作答；如需读取，请在该来源配置中添加 fetch_domains。",
+                }
+
+            fetch_info_url = str(
+                (info.get("fetch_info") or {}).get("url")
+                or ""
+            ).strip()
+
+            if fetch_info_url and fetch_info_url != fetch_url:
+                ok, reason = self._can_fetch_url(
+                    fetch_info_url,
+                    adapter.config,
+                    allow_search_result=True
+                )
+                if not ok:
+                    return {
+                        "ok": False,
+                        "error_type": "url_not_allowed",
+                        "error": f"该搜索结果链接不可读取：{reason}。",
+                       "next_action": "仅依据搜索摘要作答；如需读取，请在该来源配置中添加 fetch_domains。",
+                    }
+            
             target_domain = str(adapter.config.get("target_domain", "")).strip().lower()
             result_host = _host_of(info.get("url", ""))
             is_cross_domain = bool(
@@ -1007,13 +1053,19 @@ class WebSearchEngine:
 
         # 2) 直接 URL
         if identifier.startswith("http://") or identifier.startswith("https://"):
-            if not self._url_allowed(identifier):
+            ok, reason = self._can_fetch_url(
+                identifier,
+                None,
+                allow_search_result=False
+            )
+
+            if not ok:
                 allowed = ", ".join(sorted(self._allowed_hosts())) or "（无）"
                 return {
                     "ok": False,
                     "error_type": "url_not_allowed",
-                    "error": "该 URL 不在白名单域名内，禁止读取。",
-                    "next_action": f"只允许读取白名单域名：{allowed}",
+                    "error": f"该 URL 不可读取：{reason}。",
+                    "next_action": f"只允许读取白名单域名：{allowed}。",
                 }
             adapter = BingSiteSearchAdapter({"id": "direct_url", "display_name": "网页"})
             try:
@@ -1073,6 +1125,81 @@ class WebSearchEngine:
                 return True
         return False
 
+    # ---------- 抓取白名单 ----------
+    def _is_basic_safe_url(self, url):
+        url = str(url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return False
+
+        host = _host_of(url)
+        if not host:
+            return False
+
+        host = host.lower().strip("[]")
+
+        if host in ("localhost", "0.0.0.0", "127.0.0.1", "::1"):
+            return False
+
+        if host.endswith((".local", ".localhost", ".internal")):
+            return False
+
+        parts = host.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            try:
+                a = int(parts[0])
+                b = int(parts[1])
+
+                # 127.0.0.0/8, 10.0.0.0/8, 0.0.0.0
+                if a in (0, 10, 127):
+                    return False
+
+                # 169.254.0.0/16
+                if a == 169 and b == 254:
+                    return False
+
+                # 172.16.0.0/12
+                if a == 172 and 16 <= b <= 31:
+                    return False
+
+                # 192.168.0.0/16
+                if a == 192 and b == 168:
+                    return False
+
+            except Exception:
+                pass
+
+        return True
+
+    def _can_fetch_url(self, url, source_config=None, allow_search_result=False):
+        if not self._is_basic_safe_url(url):
+            return False, "URL 不是合法的 http/https 地址，或指向本机/内网"
+
+        if self._url_allowed(url):
+            return True, ""
+
+        host = _host_of(url)
+
+        if source_config is not None:
+            configs_to_check = [source_config]
+        else:
+            configs_to_check = InternetSettings.get_instance().enabled_sources()
+
+        for cfg in configs_to_check:
+            if not isinstance(cfg, dict):
+                continue
+
+            for allowed in (cfg.get("fetch_domains") or []):
+                allowed = str(allowed).strip().lower()
+                if not allowed:
+                    continue
+
+                if host == allowed or host.endswith("." + allowed):
+                    return True, ""
+
+            if allow_search_result and bool(cfg.get("allow_fetch_result_urls", True)):
+                return True, ""
+
+        return False, "URL 不在白名单内"
 
 # ==================== 结果格式化 ====================
 

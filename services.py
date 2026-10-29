@@ -215,6 +215,58 @@ class CodeExecutor:
         return obj
 
     @staticmethod
+    def _sanitize_json_value(value):
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+
+        if isinstance(value, np.integer):
+            return int(value)
+
+        if isinstance(value, np.floating):
+            value = float(value)
+            return value if math.isfinite(value) else None
+
+        if isinstance(value, np.bool_):
+            return bool(value)
+
+        if isinstance(value, np.ndarray):
+            return [CodeExecutor._sanitize_json_value(x) for x in value.tolist()]
+
+        if isinstance(value, (pd.Timestamp, pd.Period, pd.Interval, pd.Timedelta)):
+            return str(value)
+
+        if isinstance(value, dict):
+            return {
+                str(k): CodeExecutor._sanitize_json_value(v)
+                for k, v in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            return [CodeExecutor._sanitize_json_value(x) for x in value]
+
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+
+        return str(value)
+
+    @staticmethod
+    def _df_to_json_payload(d: pd.DataFrame):
+        if d is None:
+            return None
+
+        d = d.copy(deep=True)
+        d.columns = [str(c) for c in d.columns]
+
+        data = d.to_dict(orient="split")
+        return CodeExecutor._sanitize_json_value(data)
+    
+    @staticmethod
     def execute_code(code_str: str, df: pd.DataFrame = None, dfs: list = None):
         success, output, _ = CodeExecutor.execute_code_with_raw(code_str, df=df, dfs=dfs)
         return success, output
@@ -259,10 +311,10 @@ class CodeExecutor:
         # ===== 5. 序列化数据并调用子进程 =====
         payload = {
             "code": code_str,
-            "df": df.to_dict(orient="split") if df is not None else None,
-            "dfs": [d.to_dict(orient="split") if d is not None else None for d in dfs] if dfs else None,
+            "df": CodeExecutor._df_to_json_payload(df),
+            "dfs": [CodeExecutor._df_to_json_payload(d) for d in dfs] if dfs else None,
         }
-
+        
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
@@ -279,10 +331,18 @@ class CodeExecutor:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
             try:
-                stdout, stderr = proc.communicate(
-                    json.dumps(payload, ensure_ascii=False),
-                    timeout=600,
+                payload_text = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False
                 )
+            except Exception as e:
+                return False, f"表格数据无法安全序列化为 JSON：{e}", None
+
+            stdout, stderr = proc.communicate(
+                payload_text,
+                timeout=600,
+            )
             except subprocess.TimeoutExpired:
                 if os.name == "nt":
                     subprocess.call(
