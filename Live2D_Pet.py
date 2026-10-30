@@ -48,6 +48,7 @@ from display_config import (
     compute_display_metrics,
 )
 from interaction_controller import InteractionController
+import setting_button
 
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_long,
@@ -145,6 +146,8 @@ for group, base in SOUND_NAME_MAP.items():
 
 
 def play_sound(group_name, index):
+    if setting_button.is_audio_muted():
+        return
     if not SOUNDS:
         return
 
@@ -184,6 +187,7 @@ class Live2DPet:
         self.model = None
         self.window = None
         self.window_manager = WindowManager()
+        self.setting_button = setting_button.SettingButton(self)
         self.interaction = InteractionController(self)
         self.bubble_controller = BubbleController()
         self.bubble = self.bubble_controller.renderer
@@ -783,6 +787,10 @@ class Live2DPet:
             y_offset=self.bubble_y_offset
         )
 
+        self.setting_button.set_scale(
+            self.ui_scale, self._cached_win_w, self._cached_win_h
+        )
+
         return True
     
     def _on_window_resize(self, window, width, height):
@@ -793,6 +801,8 @@ class Live2DPet:
             win_width=width,
             win_height=height
         )
+
+        self.setting_button.set_scale(self.ui_scale, width, height)
 
         if self.model:
             self.model.Resize(width, height)
@@ -856,6 +866,9 @@ class Live2DPet:
             self.last_cursor_x, self.last_cursor_y = sx, sy
 
             wx, wy = glfw.get_window_pos(self.window)
+
+            raw_rx, raw_ry = sx - wx, sy - wy
+            self.cursor_rel_raw = (raw_rx, raw_ry)
 
             rel_x = max(0, min(win_w, sx - wx))
             rel_y = max(0, min(win_h, sy - wy))
@@ -1008,6 +1021,11 @@ class Live2DPet:
                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
 
                 self.bubble_controller.draw()
+
+                self.setting_button.tick_and_draw(
+                    now, self._cached_win_w, self._cached_win_h,
+                    cursor_rel=getattr(self, "cursor_rel_raw", None),
+                )
 
                 # 绘制独立聊天窗口
                 if self.chat_window and self.chat_window.active:

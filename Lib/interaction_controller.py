@@ -83,6 +83,8 @@ class InteractionController:
         pet = self.pet
         pet.last_interaction_time = time.time()
 
+        pet.setting_button.update_hover(xpos, ypos)
+
         if pet.chat_window and pet.chat_window.active:
             return
 
@@ -117,6 +119,9 @@ class InteractionController:
             sx, sy = pyautogui.position()
             wx, wy = glfw.get_window_pos(window)
             rel_x, rel_y = sx - wx, sy - wy
+
+            if pet.setting_button.try_click(rel_x, rel_y):
+                return
 
             part_id, is_head = pet.is_hit_part(rel_x, rel_y, HEAD_KEYWORDS)
             if is_head:
