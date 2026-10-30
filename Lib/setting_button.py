@@ -154,12 +154,14 @@ def _upload_texture(img):
 class SettingButton:
     BASE_RADIUS = 26
     BASE_MARGIN = 16
-    BASE_TOP_GAP = 110 
+    BASE_TOP_GAP = 110
     HOVER_SPEED = 15.0
-    MIN_VISIBLE_ALPHA = 0.15  # 窗口内常态半透明
+    MIN_VISIBLE_ALPHA = 0.45
     HIDDEN_EPS = 0.02
-    HOVER_ALPHA = 0.95         # 悬停高亮透明度
-    HIDDEN_ALPHA = 0.0         # 窗口外
+    # ===== 按钮可见区域 =====
+    BASE_ZONE_PAD_LEFT = 16
+    BASE_ZONE_PAD_TOP = 20
+    BASE_ZONE_BOTTOM = 530
     
     def __init__(self, pet):
         self.pet = pet
@@ -177,6 +179,9 @@ class SettingButton:
         self._icon_size = 0
         self._gl_ready = False
         self._next_rebuild_try = 0.0
+        self._zone_pad_left = self.BASE_ZONE_PAD_LEFT
+        self._zone_pad_top = self.BASE_ZONE_PAD_TOP
+        self._zone_bottom = self.BASE_ZONE_BOTTOM
 
     def set_scale(self, ui_scale, win_w, win_h):
         self._ui_scale = float(ui_scale) if ui_scale else 1.0
@@ -189,6 +194,19 @@ class SettingButton:
         if (not self._gl_ready) or abs(target_icon - self._icon_size) >= 1:
             self._rebuild_textures(target_icon)
 
+        self._zone_pad_left = max(8, int(round(self.BASE_ZONE_PAD_LEFT * self._ui_scale)))
+        self._zone_pad_top = max(8, int(round(self.BASE_ZONE_PAD_TOP * self._ui_scale)))
+        self._zone_bottom = max(200, int(round(self.BASE_ZONE_BOTTOM * self._ui_scale)))
+
+    def _show_zone(self):
+        cx, cy = self._get_center()
+        r = self._radius
+        x0 = cx - r - self._zone_pad_left
+        y0 = cy - r - self._zone_pad_top
+        x1 = float(self._win_w)                 # 右界＝窗口右缘
+        y1 = float(min(self._zone_bottom, self._win_h))
+        return x0, y0, x1, y1
+    
     def _rebuild_textures(self, icon_size):
         try:
             if self._tex_normal:
@@ -290,21 +308,21 @@ class SettingButton:
 
         # ===== 每帧重算可见性 / 悬停 =====
         if cursor_rel is None:
-            cursor_rel = self._cursor_rel()   # 兜底路径
+            cursor_rel = self._cursor_rel()   # 主循环未提供时的兜底路径
         if cursor_rel is None:
-            in_window = False
+            in_zone = False
             rx = ry = -1.0
         else:
             rx, ry = cursor_rel
-            in_window = (0.0 <= rx <= self._win_w) and (0.0 <= ry <= self._win_h)
-        
-        self.hovered = in_window and self._hit_test(rx, ry)
-        if not in_window:
-            target = self.HIDDEN_ALPHA
+            x0, y0, x1, y1 = self._show_zone()
+            in_zone = (x0 <= rx <= x1) and (y0 <= ry <= y1)
+        self.hovered = in_zone and self._hit_test(rx, ry)
+        if not in_zone:
+            target = 0.0                      # 区域外（含窗口外）：完全隐藏
         elif self.hovered:
-            target = self.HOVER_ALPHA
+            target = 1.0                      # 悬停图标：高亮
         else:
-            target = self.MIN_VISIBLE_ALPHA
+            target = self.MIN_VISIBLE_ALPHA   # 区域内未悬停：半透明
             
         if dt > 0.0:
             k = min(1.0, self.HOVER_SPEED * dt)
