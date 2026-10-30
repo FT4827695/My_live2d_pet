@@ -105,51 +105,43 @@ class InteractionController:
 
     def on_mouse_button(self, window, button, action, mods):
         pet = self.pet
-
         if action == glfw.PRESS:
             pet.last_interaction_time = time.time()
-
         # 右键：显示/隐藏独立聊天窗口
         if button == glfw.MOUSE_BUTTON_RIGHT and action == glfw.PRESS:
             pet.toggle_chat_window(window)
             return
-
         # 左键交互：点击头部/身体/拖拽
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
             sx, sy = pyautogui.position()
             wx, wy = glfw.get_window_pos(window)
             rel_x, rel_y = sx - wx, sy - wy
-
             if pet.setting_button.try_click(rel_x, rel_y):
                 return
-
             part_id, is_head = pet.is_hit_part(rel_x, rel_y, HEAD_KEYWORDS)
             if is_head:
                 now = time.time()
                 if now - self.last_click_time < self.click_cooldown:
                     return
-
                 self.last_click_time = now
                 pet.play_head_click_motion()
                 return
-
             _, is_body = pet.is_hit_part(rel_x, rel_y, BODY_KEYWORDS)
             if is_body:
                 now = time.time()
                 if now - self.last_click_time < self.click_cooldown:
                     return
-
                 self.last_click_time = now
                 pet.play_body_click_motion()
                 return
-
+            if pet.chat_window and pet.chat_window.active:
+                return
             # 未命中任何交互部件 → 拖拽窗口
             self.is_dragging = True
             self.drag_start_x, self.drag_start_y = rel_x, rel_y
-
         elif button == glfw.MOUSE_BUTTON_LEFT and action == glfw.RELEASE:
             self.is_dragging = False
-
+            
     # ==================== 全局滚轮 ====================
 
     def on_global_scroll(self, x, y, dx, dy, injected=False):

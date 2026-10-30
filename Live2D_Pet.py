@@ -719,9 +719,11 @@ class Live2DPet:
             if final_msg is None and group in MESSAGES:
                 final_msg = random.choice(MESSAGES[group])
 
-            if final_msg and self.window and (self.chat_window is None or not self.chat_window.active):
-                self.show_bubble(final_msg)
-
+            if final_msg and self.window:
+                chat_open = self.chat_window is not None and self.chat_window.active
+                if not (chat_open and group == "idle"):
+                    self.show_bubble(final_msg)
+                
             return True
 
         except Exception as e:
