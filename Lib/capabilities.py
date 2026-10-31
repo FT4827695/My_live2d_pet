@@ -7,6 +7,8 @@ from settings_store import BASE_DIR
 
 
 _CAPABILITIES_FILE = os.path.join(BASE_DIR, "config", "model_capabilities.json")
+_config_cache = None
+
 
 def _load_config():
     global _config_cache

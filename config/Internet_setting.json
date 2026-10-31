@@ -1,5 +1,5 @@
 {
-    "web_search_enabled": false,
+    "web_search_enabled": true,
     "proxy": "",
     "request_timeout_sec": 15,
     "max_results_per_source": 3,

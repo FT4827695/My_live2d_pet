@@ -382,22 +382,13 @@ class ToolLoopDriver:
             f"下一步建议: {next_action}"
         )
 
-    def run(
-        self,
-        messages,
-        tools,
-        df=None,
-        dfs=None,
-        cache_pool=None,
-        max_loops=5,
-        generation_id=None,
-        message_processor=None,
-        stats=None,
-        image_paths=None
-    ):
+    def run(self, messages, tools, df=None, dfs=None, cache_pool=None,
+            max_loops=5, generation_id=None, message_processor=None,
+            stats=None, image_paths=None):
         engine = self.pet.llm_engine
         current_messages = list(messages)
         used_fc = False
+        tool_trace = [] 
 
         searched_queries = set()
 
@@ -489,6 +480,12 @@ class ToolLoopDriver:
                             f"错误详情：{validation_error}\n"
                             f"修正要求：请检查参数类型、必填项和枚举值，确保完全符合 JSON Schema，然后重新调用该工具。"
                         )
+                        tool_trace.append({
+                            "name": func_name,
+                            "args": {"_raw": args_str[:120]},
+                            "ok": False,
+                            "result_head": validation_error[:150],
+                        })
                     else:
                         structured_result = {"tool_name": func_name, "ok": False}
 
@@ -611,6 +608,13 @@ class ToolLoopDriver:
 
                         tool_result = self._format_tool_result(structured_result)
 
+                        tool_trace.append({
+                            "name": func_name,
+                            "args": args,
+                            "ok": bool(structured_result.get("ok", False)),
+                            "result_head": tool_result[:300],
+                        })
+
                     current_messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
@@ -619,10 +623,10 @@ class ToolLoopDriver:
 
                 continue
 
-            return content, last_raw_result, last_output, used_fc
+            return content, last_raw_result, last_output, used_fc, tool_trace
 
-        return "（这...做不来了）", last_raw_result, last_output, used_fc
-
+        return "（这...做不来了）", last_raw_result, last_output, used_fc, tool_trace
+    
     def _request_view_cached_image(self, engine, cache_pool, file_no, active_image_paths):
         if cache_pool is None:
             return {

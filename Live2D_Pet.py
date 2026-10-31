@@ -8,7 +8,6 @@ plugin_dir = os.path.join(base_dir, "Lib")
 sys.path.insert(0, plugin_dir)
 
 import time
-import datetime
 import random
 import threading
 import ctypes
@@ -25,17 +24,11 @@ import live2d.v2 as live2d
 
 from dataclasses import dataclass
 from typing import Optional
-from pynput.mouse import Listener as MouseListener
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
-import GPUtil
-import win32gui, win32con, win32api
+import win32gui, win32con
 from ctypes import wintypes
 
 from model_engine import XllamaEngine
 from chat import IndependentChatWindow
-from services import MessageProcessor
-from prompt import SYSTEM_PROMPT, FALLBACK_REPLIES
 from bubble import BubbleRenderer
 from bubble_controller import BubbleController, DEFAULT_FONT_PATHS as FONT_PATHS
 from hardware_monitor import HardwareMonitor
@@ -49,16 +42,10 @@ from display_config import (
 )
 from interaction_controller import InteractionController
 from background_renderer import BackgroundRenderer
+from llm_manager import LlmManager
+from conversation_store import ConversationStore
+from agent_service import AgentService
 import setting_button
-
-WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long,
-    wintypes.HWND,
-    ctypes.c_uint,
-    wintypes.WPARAM,
-    wintypes.LPARAM
-)
-
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -224,29 +211,16 @@ class Live2DPet:
         # 独立聊天窗口实例
         self.chat_window = None
 
-        self.llm_engine = None
-        self.model_ready = False
-        self.model_loading = False
-
-        self._closing = False
-        self._runtime_cleaned = False
-
-        self.conversation_history = []
-        self.max_history = 12
-        self.system_prompt = SYSTEM_PROMPT
-
-        # ===== 竞态防护：对话轮次管理 =====
-        self._generation_id = 0
-        self._gen_lock = threading.Lock()
-
-        # ===== 文件缓存与消息处理 =====
-        self.docs_uploader = None
-        self.message_processor = None
-
-        # ===== 文件上传轮询节流 =====
-        self._file_poll_interval = 0.5
-        self._next_file_poll_time = 0.0
-
+        self.llm_manager = LlmManager(
+            on_loaded=self._on_llm_loaded,
+            on_load_failed=self._on_llm_load_failed,
+        )
+        self.agent = AgentService(
+            llm_manager=self.llm_manager,
+            on_bubble=self.queue_bubble,
+            notify_user=self._notify_user,
+        )
+        
         # ===== 动态帧率 =====
         self.last_interaction_time = time.time()
         self.active_fps = int(os.getenv("PET_ACTIVE_FPS", "45"))
@@ -273,224 +247,139 @@ class Live2DPet:
     def _compute_display_metrics(self):
         return compute_display_metrics()
     
-    # ==================== 文件服务绑定 ====================
+    # ==================== 文件 / 消息（转发到 AgentService） ====================
     def _get_active_uploader(self):
-        uploader = getattr(self, "docs_uploader", None)
-
-        if uploader is None and self.chat_window is not None:
-            uploader = getattr(self.chat_window, "doc_uploader", None)
-
-        return uploader
+        return self.agent.docs_uploader
 
     def _bind_file_services(self):
-        if self.docs_uploader is None and self.chat_window is not None:
-            self.docs_uploader = getattr(self.chat_window, "doc_uploader", None)
-        if self.chat_window is not None and getattr(self.chat_window, "vm", None) is not None:
-            self.message_processor = self.chat_window.vm.msg_processor
-        if self.message_processor is not None and self.docs_uploader is not None:
-            if getattr(self.message_processor, "uploader", None) is not self.docs_uploader:
-                self.message_processor.uploader = self.docs_uploader
-        
-    def _format_upload_success_message(self, attachments):
-        items = []
+        if self.chat_window is not None:
+            self.agent.bind_chat_window(self.chat_window)
 
-        for att in attachments:
-            filename = att.get("filename") or ""
-            base_name = os.path.splitext(os.path.basename(filename))[0] or "文件"
-
-            if len(base_name) > 4:
-                short_name = base_name[:4] + "..."
-            else:
-                short_name = base_name
-
-            label = att.get("spoken_label") or "文件"
-            file_no = att.get("file_no", "?")
-
-            items.append(f"{label}{short_name}（{file_no}号）")
-
-        if not items:
-            return "预处理成功啦！"
-
-        return "、".join(items) + " 预处理成功啦！"
-    
     def poll_file_upload(self):
-        self._bind_file_services()
-        uploader = self._get_active_uploader()
-        if uploader is None:
-            return
+        self.agent.poll()
 
-        attachments, errors = uploader.consume_results()
-
-        if attachments:
-            success_msg = self._format_upload_success_message(attachments)
-
-            if self.chat_window and self.chat_window.active:
-                self.chat_window.add_message("shizuku", success_msg)
-            else:
-                self.show_bubble(success_msg)
-
-            if self.message_processor is not None:
-                self.message_processor.last_exportable = None
-                self.message_processor.cache_attachments(attachments)
-
-        if errors:
-            for error in errors:
-                msg = error.get("reason", "文件处理失败了。")
-                if self.chat_window and self.chat_window.active:
-                    self.chat_window.add_message("shizuku", msg)
-                else:
-                    self.show_bubble(msg)
-                    
     def handle_user_message(self, user_msg: str) -> str:
-        if not user_msg:
-            return ""
-
-        self._bind_file_services()
-
-        self.poll_file_upload()
-
-        uploader = self._get_active_uploader()
-        if uploader:
-            uploader.on_turn_finished()
-
-        processor = self.message_processor
-        if processor is None:
-            return self._fallback_reply(user_msg)
-
-        file_nos = []
-        if hasattr(processor, 'cache_pool'):
-            file_nos = processor.cache_pool.resolve_file_nos(user_msg)
-
-        reply = processor.get_reply(user_msg, file_nos=file_nos)
-
-        if processor and hasattr(processor, 'cache_pool'):
-            processor.cache_pool.tick()
-
-        return reply or "（模型没有生成有效回复）"
+        return self.agent.handle_user_message(user_msg)
     
-    # ==================== 模型加载 / 卸载 ====================
-    def load_llm_manually(self, use_gpu: bool, use_mmproj: bool = True):
-        """供 UI 层调用的手动加载接口"""
-        if self.model_loading:
-            return
+    # ==================== 兼容层（供 chat_window / menu_manager 使用） ====================
+    @property
+    def llm_engine(self):
+        return self.llm_manager.engine
 
-        if self.llm_engine and self.llm_engine.server is not None:
-            self.unload_llm()
+    @property
+    def model_ready(self):
+        return self.llm_manager.is_ready
 
-        self.model_loading = True
+    @property
+    def model_loading(self):
+        return self.llm_manager.is_loading
+    
+    @property
+    def conversation_store(self):
+        return self.agent.conversation_store
 
-        def worker():
+    @property
+    def system_prompt(self):
+        return self.agent.system_prompt
+
+    @system_prompt.setter
+    def system_prompt(self, value):
+        self.agent.system_prompt = value
+
+    @property
+    def conversation_history(self):
+        return self.agent.conversation_history
+
+    @conversation_history.setter
+    def conversation_history(self, value):
+        self.agent.conversation_history = value
+
+    @property
+    def max_history(self):
+        return self.agent.max_history
+
+    @property
+    def message_processor(self):
+        return self.agent.message_processor
+
+    @message_processor.setter
+    def message_processor(self, value):
+        self.agent.message_processor = value
+
+    @property
+    def docs_uploader(self):
+        return self.agent.docs_uploader
+
+    @docs_uploader.setter
+    def docs_uploader(self, value):
+        self.agent.docs_uploader = value
+        if value is not None and self.agent.message_processor is not None:
             try:
-                from model_engine import XllamaEngine
-
-                engine = XllamaEngine()
-
-                if engine.start_server(use_gpu=use_gpu, use_mmproj=use_mmproj):
-                    if getattr(self, "_closing", False):
-                        try:
-                            engine.stop_server()
-                        except Exception:
-                            pass
-                        return
-
-                    self.llm_engine = engine
-                    self.model_ready = True
-
-                    mode_desc = "显卡" if use_gpu else "内存"
-                    mm_desc = "多模态" if use_mmproj else "纯文本"
-
-                    self.queue_bubble("现在可以聊天啦！")
-
-                    if not engine.supports_function_calling():
-                        self.queue_bubble("这个脑子笨笨的...")
-
-                    if self.chat_window and self.chat_window.active:
-                        self.chat_window.add_message(
-                            "shizuku",
-                            f"大脑加载完毕（{mode_desc}/{mm_desc}）"
-                        )
-                else:
-                    if getattr(self, "_closing", False):
-                        return
-        
-                    self.model_ready = False
-                    self.queue_bubble("呜...模型加载失败了。")
-
-                    if self.chat_window and self.chat_window.active:
-                        self.chat_window.add_message("shizuku", "加载失败。")
-
-            except Exception as e:
-                print(f"[主控] 模型加载异常: {e}")
-                if not getattr(self, "_closing", False):
-                    self.model_ready = False
-            finally:
-                self.model_loading = False
-        
-        threading.Thread(target=worker, daemon=True).start()
-
-    def unload_llm(self):
-        if self.llm_engine:
-            self.llm_engine.stop_server()
-            self.llm_engine = None
-
-        self.model_ready = False
-        self.model_loading = False
-        self.conversation_history = []
-
-        self._bind_file_services()
-
-        uploader = self._get_active_uploader()
-        if uploader:
-            uploader.clear_all(reset_counters=True)
-            uploader.reset_upload_state()
-
-        if self.message_processor:
-            self.message_processor.clear_cache()
-            self.message_processor.force_clear_cache()
-            
-    def _shutdown_llm(self):
-        self._closing = True
-
-        engine = getattr(self, "llm_engine", None)
-        if engine is not None:
-            try:
-                engine.abort_generation()
+                if getattr(self.agent.message_processor, "uploader", None) is not value:
+                    self.agent.message_processor.uploader = value
             except Exception:
                 pass
+            
+    def next_generation(self) -> int:
+        return self.agent.next_generation()
 
-            try:
-                engine.stop_server()
-            except Exception as e:
-                print(f"[退出] 停止模型引擎失败: {e}")
+    def is_generation_current(self, gen_id) -> bool:
+        return self.agent.is_generation_current(gen_id)
 
-        self.llm_engine = None
-        self.model_ready = False
-        self.model_loading = False
+    def _fallback_reply(self, user_msg) -> str:
+        return self.agent._fallback_reply(user_msg)
     
+    def _on_llm_loaded(self, engine, use_gpu: bool, use_mmproj: bool):
+        mode_desc = "显卡" if use_gpu else "内存"
+        mm_desc = "多模态" if use_mmproj else "纯文本"
+
+        self.queue_bubble("现在可以聊天啦！")
+
+        try:
+            if not engine.supports_function_calling():
+                self.queue_bubble("这个脑子笨笨的...")
+        except Exception:
+            pass
+
+        if self.chat_window and self.chat_window.active:
+            self.chat_window.add_message(
+                "shizuku", f"大脑加载完毕（{mode_desc}/{mm_desc}）"
+            )
+
+    def _on_llm_load_failed(self, error_msg: str):
+        self.queue_bubble("呜...模型加载失败了。")
+        if self.chat_window and self.chat_window.active:
+            self.chat_window.add_message("shizuku", "加载失败。")
+
+    def load_llm_manually(self, use_gpu: bool, use_mmproj: bool = True):
+        """供 UI 层调用的手动加载接口。"""
+        if self.llm_manager.is_loading:
+            return
+
+        if self.llm_manager.engine is not None:
+            self.unload_llm()
+
+        self.llm_manager.load(use_gpu=use_gpu, use_mmproj=use_mmproj)
+
+    def unload_llm(self):
+        self.llm_manager.unload()
+        self.agent.clear_for_reload()
+        
+    def _shutdown_llm(self):
+        self._closing = True
+        self.llm_manager.shutdown()
+        
     def _cleanup_runtime(self):
         if getattr(self, "_runtime_cleaned", False):
             return
-
         self._runtime_cleaned = True
 
         self._shutdown_llm()
 
         try:
-            uploader = self._get_active_uploader()
-            if uploader:
-                if hasattr(uploader, "shutdown"):
-                    uploader.shutdown()
-                else:
-                    uploader.clear_all(reset_counters=True)
+            self.agent.shutdown()
         except Exception as e:
-            print(f"[退出] 清理上传器失败: {e}")
-
-        try:
-            if getattr(self, "message_processor", None):
-                self.message_processor.clear_cache()
-                self.message_processor.force_clear_cache()
-        except Exception as e:
-            print(f"[退出] 清理消息处理器失败: {e}")
+            print(f"[退出] AgentService 清理失败: {e}")
 
         try:
             self.bubble_controller.cleanup()
@@ -559,18 +448,27 @@ class Live2DPet:
 
     def queue_bubble(self, text):
         self.bubble_controller.queue(text)
+
+    def _notify_user(self, text: str):
+        if self.chat_window is not None and getattr(self.chat_window, "active", False):
+            try:
+                self.chat_window.add_message("shizuku", text)
+                return
+            except Exception:
+                pass
+        self.show_bubble(text)
         
     # ==================== 聊天窗口切换 ====================
     def toggle_chat_window(self, window):
         if self.chat_window is None:
             self.chat_window = IndependentChatWindow(window, self, display_scale=self.ui_scale)
-            self._bind_file_services()
+            self.agent.bind_chat_window(self.chat_window)
 
         if self.chat_window.active:
             self.chat_window.hide()
         else:
             self.chat_window.show()
-
+            
     # ==================== 点击动作封装 ====================
 
     def play_head_click_motion(self):
@@ -960,12 +858,7 @@ class Live2DPet:
             while not glfw.window_should_close(self.window):
                 glfw.poll_events()
 
-                # ===== 轮询文件上传结果 =====
-                if self.chat_window is not None or getattr(self, "docs_uploader", None) is not None:
-                    current_poll_time = time.time()
-                    if current_poll_time >= self._next_file_poll_time:
-                        self.poll_file_upload()
-                        self._next_file_poll_time = current_poll_time + self._file_poll_interval
+                self.agent.poll()
         
                 live2d.clearBuffer(0.0, 0.0, 0.0, 0.0)
 
@@ -1086,20 +979,6 @@ class Live2DPet:
         finally:
             self._cleanup_runtime()
         
-    # ==================== 竞态防护 ====================
-    def next_generation(self):
-        with self._gen_lock:
-            self._generation_id += 1
-            return self._generation_id
-
-    def is_generation_current(self, gen_id):
-        with self._gen_lock:
-            return gen_id == self._generation_id
-
-    def _fallback_reply(self, user_message):
-        return random.choice(FALLBACK_REPLIES)
-
-
 if __name__ == "__main__":
     pet = Live2DPet()
     pet.run()

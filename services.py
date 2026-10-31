@@ -16,7 +16,7 @@ from rag_utils import AttachmentCachePool
 import time
 
 from prompt import get_character_name
-from response_stats import ResponseStats, estimate_text_tokens, estimate_messages_tokens
+from response_stats import ResponseStats, estimate_text_tokens
 
 ASSISTANT_NAME = get_character_name()
 ASSISTANT_PREFIX = ASSISTANT_NAME + ": "
@@ -592,22 +592,15 @@ class MessageProcessor:
         }
 
 
-    def _safe_append_history_agent(self, u_msg, a_msg, generation_id, used_fc=False):
-        if generation_id is None or self.pet.is_generation_current(generation_id):
-            self.pet.conversation_history.append({"role": "user", "content": u_msg})
-
-            if used_fc:
-                tagged_msg = f"[基于工具调用结果]\n{a_msg}"
-            else:
-                tagged_msg = a_msg
-
-            self.pet.conversation_history.append({"role": "assistant", "content": tagged_msg})
-
-            max_history = getattr(self.pet, "max_history", 12)
-
-            if len(self.pet.conversation_history) > max_history * 2:
-                self.pet.conversation_history = self.pet.conversation_history[-(max_history * 2):]
-
+    def _safe_append_history_agent(self, u_msg, a_msg, generation_id, tool_trace=None):
+        if generation_id is not None and not self.pet.is_generation_current(generation_id):
+            return
+        self.pet.conversation_store.append_turn(
+            user=u_msg,
+            assistant=a_msg,
+            tool_trace=tool_trace or [],
+        )
+        
     def _reply_agent_mode(self, user_msg, file_nos, entries, generation_id=None, stream_callback=None, stats=None):
         if not self.pet.model_ready or not self.pet.llm_engine:
             if getattr(self.pet, "model_loading", False):
@@ -839,6 +832,7 @@ class MessageProcessor:
         raw_result = None
         output = ""
         used_fc = False
+        tool_trace = []
 
         if supports_fc:
             from tools import (
@@ -865,39 +859,40 @@ class MessageProcessor:
                 tools.append(get_read_web_article_tool_schema())
             driver = ToolLoopDriver(self.pet)
 
-            final_reply, raw_result, output, used_fc = driver.run(
-                messages,
-                tools,
-                cache_pool=self.cache_pool,
-                max_loops=8,
-                generation_id=generation_id,
-                message_processor=self,
-                stats=stats,
-                image_paths=[],
+            final_reply, raw_result, output, used_fc, tool_trace = driver.run(
+                messages, tools, cache_pool=self.cache_pool,
+                max_loops=8, generation_id=generation_id,
+                message_processor=self, stats=stats, image_paths=[],
             )
         else:
             from legacy_tools import LegacyCodeBlockDriver
 
             legacy_driver = LegacyCodeBlockDriver(self.pet)
 
-            final_reply, raw_result, output, used_fc = legacy_driver.run(
-                messages,
-                cache_pool=self.cache_pool,
-                max_loops=3,
-                generation_id=generation_id,
-                message_processor=self,
-                stats=stats,
-                image_paths=[],
+            final_reply, raw_result, output, used_fc, _ = legacy_driver.run(
+                messages, cache_pool=self.cache_pool,
+                max_loops=3, generation_id=generation_id,
+                message_processor=self, stats=stats, image_paths=[],
             )
 
         # ============ 防幻觉拦截  ============
         if (supports_fc and not used_fc and web_search_enabled
                 and final_reply and isinstance(final_reply, str)):
+            current_year = time.localtime().tm_year
             fact_patterns = [
-                r"20\d{2}\s*年",
+                rf"(?:{current_year}|{current_year - 1})\s*年",
                 r"\d{1,2}\s*月\s*\d{1,2}\s*日",
             ]
-            has_specific_date = any(re.search(p, final_reply) for p in fact_patterns)
+
+            def _has_unverified_fact(text):
+                for p in fact_patterns:
+                    for m in re.finditer(p, text):
+                        token = m.group(0)
+                        if token not in user_msg and token not in index_hint:
+                            return True
+                return False
+
+            has_specific_date = _has_unverified_fact(final_reply)
             has_quote_source = ("来源：" in final_reply or "来源:" in final_reply
                                 or "http://" in final_reply or "https://" in final_reply)
 
@@ -914,7 +909,7 @@ class MessageProcessor:
                 ]
                 from tools import ToolLoopDriver
                 driver = ToolLoopDriver(self.pet)
-                retry_reply, raw_result, output, retry_used_fc = driver.run(
+                retry_reply, raw_result, output, retry_used_fc, retry_trace = driver.run(
                     reflect_messages, tools,
                     cache_pool=self.cache_pool,
                     max_loops=6,
@@ -926,18 +921,23 @@ class MessageProcessor:
                 if retry_reply and retry_used_fc:
                     final_reply = retry_reply
                     used_fc = True
-
+                    tool_trace = retry_trace
+                    
         # ==================================================
 
         fail_code = self._detect_reply_failure(final_reply)
 
         if fail_code:
             failure_msg = self._make_failure_reply(fail_code, entries)
-            self._safe_append_history_agent(user_msg, final_reply, generation_id)
+            self._safe_append_history_agent(
+                user_msg, final_reply, generation_id, tool_trace=tool_trace
+            )
             return final_reply, fail_code
 
-        self._safe_append_history_agent(user_msg, final_reply, generation_id)
-
+        self._safe_append_history_agent(
+            user_msg, final_reply, generation_id, tool_trace=tool_trace
+        )
+        
         has_substantive_result = (raw_result is not None) or bool(output)
 
         if has_substantive_result:
@@ -1041,71 +1041,27 @@ class MessageProcessor:
 
         return final_reply
 
-    def _trim_history_to_fit(self, history, system_tokens, current_user_tokens,
-                             max_prompt_tokens, image_tokens=0):
-        fixed_tokens = system_tokens + current_user_tokens + image_tokens
-        remaining = max_prompt_tokens - fixed_tokens
-
-        if remaining <= 0:
-            return []
-
-        trimmed = list(history)
-        total_history_tokens = estimate_messages_tokens(trimmed)
-
-        while total_history_tokens > remaining and len(trimmed) > 0:
-            if len(trimmed) >= 2:
-                first_role = trimmed[0].get("role")
-                second_role = trimmed[1].get("role")
-
-                if (
-                    (first_role == "user" and second_role == "assistant")
-                    or (first_role == "assistant" and second_role == "user")
-                ):
-                    removed1 = trimmed.pop(0)
-                    removed2 = trimmed.pop(0)
-                    total_history_tokens -= estimate_messages_tokens([removed1])
-                    total_history_tokens -= estimate_messages_tokens([removed2])
-                    continue
-
-            removed = trimmed.pop(0)
-            total_history_tokens -= estimate_messages_tokens([removed])
-
-        return trimmed
-
     # ---------- 辅助：构建带历史的 messages ----------
     def _build_messages_with_history(self, user_msg, system_override=None, image_count=0):
         system = system_override or getattr(self.pet, "system_prompt", "")
-        max_history = getattr(self.pet, "max_history", 12)
-        raw_history = getattr(self.pet, "conversation_history", [])[-(max_history * 2):]
 
         current_time = time.localtime()
         weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         time_context = f"<sys_time>{time.strftime('%Y-%m-%d %H:%M', current_time)} {weekdays[current_time.tm_wday]}</sys_time>"
-
         user_content = f"{time_context}\n{user_msg}"
 
         n_ctx = int(os.environ.get("XLLAMA_CTX", 8192))
         max_gen_tokens = max(256, int(n_ctx * 0.4))
         max_prompt_tokens = n_ctx - max_gen_tokens
 
-        system_tokens = estimate_text_tokens(system)
-        current_user_tokens = estimate_text_tokens(user_content)
-        image_tokens = image_count * 1536
-
-        safe_history = self._trim_history_to_fit(
-            raw_history,
-            system_tokens=system_tokens,
-            current_user_tokens=current_user_tokens,
+        return self.pet.conversation_store.build_api_messages(
+            system=system,
+            user_content=user_content,
+            estimate_fn=estimate_text_tokens,
             max_prompt_tokens=max_prompt_tokens,
-            image_tokens=image_tokens,
+            image_tokens=image_count * 1536,
         )
-
-        return [
-            {"role": "system", "content": system},
-            *safe_history,
-            {"role": "user", "content": user_content}
-        ]
-
+    
     def _describe_excel_entry(self, entry, var_name: str, status_label: str) -> str:
         meta = entry.get("meta") or {}
         label = meta.get("spoken_label", "表格")

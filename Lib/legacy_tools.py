@@ -73,7 +73,7 @@ class LegacyCodeBlockDriver:
 
         for loop_idx in range(max_loops):
             if _aborted():
-                return "（已停止）", last_raw_result, last_output, used_fc
+                return "（已停止）", last_raw_result, last_output, used_fc, []
 
             raw = engine.generate(
                 current_messages,
@@ -82,7 +82,7 @@ class LegacyCodeBlockDriver:
             )
 
             if raw is None:
-                return None, last_raw_result, last_output, used_fc
+                return None, last_raw_result, last_output, used_fc, []
 
             if stats is not None:
                 stats.record_raw_dict(raw, messages=current_messages)
@@ -137,6 +137,6 @@ class LegacyCodeBlockDriver:
                 })
                 continue
 
-            return content, last_raw_result, last_output, used_fc
+            return content, last_raw_result, last_output, used_fc, []
 
-        return "（处理轮数达到上限）", last_raw_result, last_output, used_fc
+        return "（处理轮数达到上限）", last_raw_result, last_output, used_fc, []
