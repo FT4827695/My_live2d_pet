@@ -92,10 +92,14 @@ class ClipboardService:
                 wc.CloseClipboard()
             if not data:
                 return []
+            
+            if isinstance(data, str):
+                return [data]
+                
             return [str(p) for p in data if p]
         except Exception:
             return []
-
+        
 # ================== 2. 文本工具 =================
 class TextUtils:
 
