@@ -6,6 +6,11 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 try:
+    from settings_store import BASE_DIR
+except Exception:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+try:
     import glfw
 except Exception:
     glfw = None
@@ -40,8 +45,7 @@ def _get_character_file_path() -> str:
         pass
 
     # 兜底
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "character.json")
-
+    return os.path.join(BASE_DIR, "config", "character.json")
 
 def _clear_character_cache() -> None:
     try:
@@ -740,6 +744,8 @@ class CharacterEditor:
         ]
 
         dirs = []
+
+        dirs.append(os.path.join(BASE_DIR, "Image"))
 
         try:
             dirs.append(os.path.dirname(_get_character_file_path()))

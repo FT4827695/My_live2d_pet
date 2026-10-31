@@ -48,6 +48,7 @@ from display_config import (
     compute_display_metrics,
 )
 from interaction_controller import InteractionController
+from background_renderer import BackgroundRenderer
 import setting_button
 
 WNDPROC = ctypes.WINFUNCTYPE(
@@ -199,6 +200,7 @@ class Live2DPet:
         self.idle_after_user_cooldown = 5.0
 
         self.hardware_monitor = HardwareMonitor(alert_cooldown=30, poll_interval=10)
+        self.background = BackgroundRenderer(self)
 
         self.motion_lock = False
         self.lock_end_time = 0.0
@@ -536,6 +538,18 @@ class Live2DPet:
             print(f"[退出] 清理纹理缓存失败: {e}")
 
         try:
+            if getattr(self, "background", None) is not None:
+                self.background.destroy()
+        except Exception as e:
+            print(f"[退出] 清理背景失败: {e}")
+
+        try:
+            if getattr(self, "setting_button", None) is not None:
+                self.setting_button.destroy()
+        except Exception as e:
+            print(f"[退出] 清理按钮组失败: {e}")
+
+        try:
             Live2DPet.clear_json_cache()
         except Exception as e:
             print(f"[退出] 清理 JSON 缓存失败: {e}")
@@ -789,9 +803,7 @@ class Live2DPet:
             y_offset=self.bubble_y_offset
         )
 
-        self.setting_button.set_scale(
-            self.ui_scale, self._cached_win_w, self._cached_win_h
-        )
+        self.setting_button.set_scale(self.ui_scale)
 
         return True
     
@@ -804,7 +816,7 @@ class Live2DPet:
             win_height=height
         )
 
-        self.setting_button.set_scale(self.ui_scale, width, height)
+        self.setting_button.set_scale(self.ui_scale)
 
         if self.model:
             self.model.Resize(width, height)
@@ -928,6 +940,8 @@ class Live2DPet:
             self.motion_transition_end = 0.0
             self.hardware_monitor.start()
             self.bubble_controller.init()
+            self.background.init()
+            setting_button.enforce_mixer_state()
 
             now = time.time()
             self.last_idle_time = now
@@ -1013,6 +1027,11 @@ class Live2DPet:
                         self.idle_interval = random.uniform(30, 60)
 
                 self.update_parameters_smooth()
+
+                chat_active = bool(
+                    self.chat_window is not None and getattr(self.chat_window, "active", False)
+                )
+                self.background.tick_and_draw(now, self._cached_win_w, self._cached_win_h, chat_active)
 
                 # 绘制主窗口模型
                 self.model.Update()

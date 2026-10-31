@@ -49,28 +49,18 @@ MTP_OPTIONS = [
 ]
 
 
-def _get_model_settings_path() -> str:
+def _get_root_dir() -> str:
     if getattr(sys, "frozen", False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_dir, "model_settings.json")
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _get_model_settings_path() -> str:
+    return os.path.join(_get_root_dir(), "config", "model_settings.json")
 
 
 def _get_character_file_path() -> str:
-    if getattr(sys, "frozen", False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base_dir, "character.json"),                    # 直接在根目录运行
-        os.path.join(os.path.dirname(base_dir), "character.json"),   # 在 chat/ 子目录运行
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return candidates[-1]
-
+    return os.path.join(_get_root_dir(), "config", "character.json")
 
 class ModelSettings:
     DEFAULTS: Dict[str, Any] = {

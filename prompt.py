@@ -7,15 +7,15 @@ from functools import lru_cache
 
 # ================== 角色配置 ==================
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_CHARACTER_FILE = os.path.join(_BASE_DIR, "character.json")
+from settings_store import BASE_DIR
 
+_CHARACTER_FILE = os.path.join(BASE_DIR, "config", "character.json")
 
 @lru_cache(maxsize=1)
 def _load_character_data():
     default = {
         "name": "雫",
-        "character_description": "你是桌面助手，一个可爱的二次元少女角色。"
+        "description": "你是桌面助手，一个可爱的二次元少女角色。"
     }
 
     try:
@@ -23,22 +23,21 @@ def _load_character_data():
             data = json.load(f)
 
         name = str(data.get("name", default["name"])).strip()
-        desc = str(data.get("character_description", default["character_description"])).strip()
+        desc = str(data.get("character_description", default["description"])).strip()
 
         if not name:
             name = default["name"]
 
         if not desc:
-            desc = default["character_description"]
+            desc = default["description"]
 
         return {
             "name": name,
             "description": desc
         }
 
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, AttributeError):
         return default
-
 
 def get_character_name() -> str:
     return _load_character_data()["name"]

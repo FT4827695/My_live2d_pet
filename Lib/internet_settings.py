@@ -1,20 +1,13 @@
 # internet_settings.py
 import os
-import sys
 import json
 import copy
 import threading
 
-
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.abspath(__file__))
+from settings_store import BASE_DIR
 
 
-_INTERNET_SETTING_PATH = os.path.join(get_base_dir(), "Internet_setting.json")
-
+_INTERNET_SETTING_PATH = os.path.join(BASE_DIR, "config", "Internet_setting.json")
 
 _DEFAULT_SETTINGS = {
     "web_search_enabled": False,

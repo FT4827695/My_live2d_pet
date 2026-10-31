@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "audio": {
+    "muted": false
+  },
+  "background": {
+    "enabled": false,
+    "file": "background.png",
+    "opacity": 1.0,
+    "dim_on_chat": true,
+    "dim_alpha": 0.45
+  }
+}

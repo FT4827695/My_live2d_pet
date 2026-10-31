@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import os
-import sys
 import json
 
-
-def _get_base_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+from settings_store import BASE_DIR
 
 
-_CAPABILITIES_FILE = os.path.join(_get_base_dir(), "model_capabilities.json")
-_config_cache = None
-
+_CAPABILITIES_FILE = os.path.join(BASE_DIR, "config", "model_capabilities.json")
 
 def _load_config():
     global _config_cache

@@ -1,314 +1,439 @@
-# -- coding: utf-8 --
+# setting_button.py
+# -*- coding: utf-8 -*-
+"""
+设置按钮组（可扩展）
+"""
+
 import os
-import sys
-import json
-import time as _time
+import math
+import time
+
 import numpy as np
-import OpenGL.GL as gl
-import glfw
+from OpenGL import GL as gl
 from PIL import Image, ImageDraw
 
-try:
-    import win32api
-except Exception:
-    win32api = None
+from settings_store import get_settings
 
-# ==================== 音频静音控制 ====================
-_state_loaded = False
-_audio_muted = False
-_state_file_path = None
+# ==================== 布局常量 ====================
 
+BASE_RADIUS = 28.0        # 按钮半径
+BASE_MARGIN = 10.0        # 右边距
+BASE_TOP_GAP = 120.0       # 顶部间距
+BASE_BUTTON_GAP = 10.0    # 按钮之间的间距
+ZONE_PADDING = 28.0       # 显示区域外扩
+ZONE_PADDING_Y = 160.0     # 显示区域外扩（垂直方向）
 
-def _get_state_file_path():
-    global _state_file_path
-    if _state_file_path is not None:
-        return _state_file_path
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    _state_file_path = os.path.join(base, "mute_state.json")
-    return _state_file_path
+HOVER_SPEED = 12.0        # 平滑速度
+BASE_VISIBLE = 0.45       # 区域内未悬停时的可见度
+HIDDEN_EPS = 0.01
 
+SS = 3                    # 图标超采样倍数
 
-def _load_state_once():
-    global _state_loaded, _audio_muted
-    if _state_loaded:
-        return
-    _state_loaded = True
-    try:
-        path = _get_state_file_path()
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            _audio_muted = bool(data.get("audio_muted", False))
-    except Exception as e:
-        print(f"[SettingButton] 读取静音状态失败: {e}")
+# ==================== 音频状态（内存缓存） ====================
 
-
-def _save_state():
-    try:
-        path = _get_state_file_path()
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"audio_muted": _audio_muted}, f)
-        os.replace(tmp, path)
-    except Exception:
-        pass
+_settings = get_settings()
+_audio_muted = _settings.get_bool("audio.muted", False)
+_mixer_synced = None
 
 
 def is_audio_muted():
-    _load_state_once()
     return _audio_muted
 
 
-def enforce_mixer_state():
+def _apply_mixer_state(force=False):
+    global _mixer_synced
+    if not force and _mixer_synced == _audio_muted:
+        return
     try:
         import pygame
         if pygame.mixer.get_init() is None:
             return
-        target = 0.0 if _audio_muted else 1.0
-        if abs(pygame.mixer.get_volume() - target) > 1e-6:
-            pygame.mixer.set_volume(target)
+        pygame.mixer.set_volume(0.0 if _audio_muted else 1.0)
+        _mixer_synced = _audio_muted
     except Exception:
         pass
 
 
+def enforce_mixer_state():
+    _apply_mixer_state(force=True)
+
+
 def set_audio_muted(v):
     global _audio_muted
-    _load_state_once()
     new_state = bool(v)
-    changed = (new_state != _audio_muted)
-    _audio_muted = new_state
-    _save_state()
-    if not changed:
+    if new_state == _audio_muted:
         return
-    if _audio_muted:
+    _audio_muted = new_state
+    _settings.set("audio.muted", new_state)   # 写盘只在这里
+    if new_state:
         try:
             import pygame
             if pygame.mixer.get_init() is not None:
                 pygame.mixer.stop()
         except Exception:
             pass
-    enforce_mixer_state()
+    _apply_mixer_state()
 
 
-# ==================== 纹理生成与预乘处理 ====================
-def _draw_speaker_icon(size, muted):
-    size = max(32, int(size))
-    ss = 4
-    s = size * ss
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    # 深色半透明圆底
-    margin = int(s * 0.05)
-    draw.ellipse([margin, margin, s - margin, s - margin], fill=(20, 20, 20, 220))
-    # 外发光边框（根据状态改变颜色）
-    border_color = (255, 100, 100, 255) if muted else (200, 200, 200, 255)
-    draw.ellipse([margin, margin, s - margin, s - margin],
-                 outline=border_color, width=max(2, int(s * 0.03)))
-    # 喇叭图形
-    fg = (255, 80, 80, 255) if muted else (255, 255, 255, 255)
-    cy = s * 0.50
+def is_background_enabled():
+    return _settings.get_bool("background.enabled", False)
+
+
+def set_background_enabled(v):
+    _settings.set("background.enabled", bool(v))
+
+
+# ==================== 图标生成 ====================
+
+def _draw_speaker(d, cx, cy, s, color, muted):
+    """喇叭图标"""
+    bw = s * 0.16
     body = [
-        (s * 0.22, s * 0.42), (s * 0.34, s * 0.42), (s * 0.48, s * 0.28),
-        (s * 0.48, s * 0.72), (s * 0.34, s * 0.58), (s * 0.22, s * 0.58),
+        (cx - s * 0.34, cy - s * 0.12),
+        (cx - s * 0.16, cy - s * 0.12),
+        (cx + s * 0.02, cy - s * 0.30),
+        (cx + s * 0.02, cy + s * 0.30),
+        (cx - s * 0.16, cy + s * 0.12),
+        (cx - s * 0.34, cy + s * 0.12),
     ]
-    draw.polygon(body, fill=fg)
-    draw.rectangle([s * 0.16, s * 0.44, s * 0.24, s * 0.56], fill=fg)
-    if not muted:
-        arc_cx = s * 0.54
-        for rp_ratio, wd_ratio in ((0.10, 0.035), (0.18, 0.030), (0.26, 0.025)):
-            rp = int(s * rp_ratio)
-            wd = max(2, int(s * wd_ratio))
-            draw.arc([int(arc_cx - rp), int(cy - rp), int(arc_cx + rp), int(cy + rp)],
-                     start=-55, end=55, fill=fg, width=wd)
+    d.polygon(body, fill=color)
+    if muted:
+        w = max(2, int(s * 0.075))
+        d.line([(cx + s * 0.10, cy - s * 0.20), (cx + s * 0.38, cy + s * 0.20)],
+               fill=color, width=w)
+        d.line([(cx + s * 0.38, cy - s * 0.20), (cx + s * 0.10, cy + s * 0.20)],
+               fill=color, width=w)
     else:
-        wd = max(2, int(s * 0.05))
-        draw.line([(s * 0.60, s * 0.34), (s * 0.84, s * 0.66)], fill=fg, width=wd)
-        draw.line([(s * 0.60, s * 0.66), (s * 0.84, s * 0.34)], fill=fg, width=wd)
-    img = img.resize((size, size), Image.LANCZOS)
-    # 预乘 Alpha，配合 (ONE, ONE_MINUS_SRC_ALPHA) 混合
-    data = np.array(img, dtype=np.float32)
-    alpha = data[:, :, 3:4] / 255.0
-    data[:, :, 0:3] *= alpha
-    return Image.fromarray(data.astype(np.uint8), "RGBA")
+        w = max(2, int(s * 0.065))
+        for i, r in enumerate((0.16, 0.28)):
+            box = [cx + s * 0.02 - s * r, cy - s * r,
+                   cx + s * 0.02 + s * r, cy + s * r]
+            d.arc(box, start=-55, end=55, fill=color, width=w)
 
 
-def _upload_texture(img):
-    data = img.tobytes("raw", "RGBA")
-    tex = gl.glGenTextures(1)
-    gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
-    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+def _draw_picture(d, cx, cy, s, color, enabled):
+    """相框 / 图片图标"""
+    w = max(2, int(s * 0.07))
+    x0, y0 = cx - s * 0.34, cy - s * 0.26
+    x1, y1 = cx + s * 0.34, cy + s * 0.26
+    d.rounded_rectangle([x0, y0, x1, y1], radius=s * 0.08,
+                        outline=color, width=w)
+    d.ellipse([cx - s * 0.20, cy - s * 0.16,
+               cx - s * 0.06, cy - s * 0.02], fill=color)
+    d.polygon([
+        (x0 + w, y1 - w),
+        (cx - s * 0.04, cy + s * 0.02),
+        (cx + s * 0.10, cy + s * 0.16),
+        (cx + s * 0.20, cy + s * 0.06),
+        (x1 - w, y1 - w),
+    ], fill=color)
+    if not enabled:
+        lw = max(2, int(s * 0.075))
+        d.line([(x0 - s * 0.04, y1 + s * 0.04), (x1 + s * 0.04, y0 - s * 0.04)],
+               fill=color, width=lw)
+
+
+_ICON_DRAWERS = {
+    "audio": _draw_speaker,
+    "background": _draw_picture,
+}
+
+
+def _make_button_image(diameter, kind, active):
+    size = max(8, int(diameter * SS))
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pad = size * 0.06
+    box = [pad, pad, size - pad, size - pad]
+
+    d.ellipse(box, fill=(24, 26, 32, 205))
+
+    if kind == "audio":
+        ring = (235, 120, 120, 235) if active else (150, 205, 255, 235)
+        icon = (240, 240, 245, 255)
+    else:
+        ring = (150, 205, 255, 235) if active else (140, 145, 155, 220)
+        icon = (240, 240, 245, 255) if active else (170, 175, 185, 255)
+
+    d.ellipse(box, outline=ring, width=max(2, int(size * 0.045)))
+    _ICON_DRAWERS[kind](d, size / 2.0, size / 2.0, size * 0.62, icon, active)
+
+    img = img.resize((max(8, int(diameter)), max(8, int(diameter))),
+                     Image.LANCZOS)
+
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr[..., :3] *= arr[..., 3:4]           # 预乘
+    return (arr * 255.0).astype(np.uint8).tobytes(), img.size[0], img.size[1]
+
+
+# ==================== Shader ====================
+
+_VS = """
+#version 330 core
+layout(location=0) in vec2 aPos;
+layout(location=1) in vec2 aUV;
+uniform vec2 uScreen;
+out vec2 vUV;
+void main(){
+    vec2 ndc = vec2(aPos.x / uScreen.x * 2.0 - 1.0,
+                    1.0 - aPos.y / uScreen.y * 2.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    vUV = aUV;
+}
+"""
+
+_FS = """
+#version 330 core
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform float uAlpha;
+out vec4 FragColor;
+void main(){
+    FragColor = texture(uTex, vUV) * uAlpha;
+}
+"""
+
+
+def _compile(vs_src, fs_src):
+    vs = gl.glCreateShader(gl.GL_VERTEX_SHADER)
+    gl.glShaderSource(vs, vs_src)
+    gl.glCompileShader(vs)
+    if not gl.glGetShaderiv(vs, gl.GL_COMPILE_STATUS):
+        raise RuntimeError(gl.glGetShaderInfoLog(vs))
+    fs = gl.glCreateShader(gl.GL_FRAGMENT_SHADER)
+    gl.glShaderSource(fs, fs_src)
+    gl.glCompileShader(fs)
+    if not gl.glGetShaderiv(fs, gl.GL_COMPILE_STATUS):
+        raise RuntimeError(gl.glGetShaderInfoLog(fs))
+    p = gl.glCreateProgram()
+    gl.glAttachShader(p, vs)
+    gl.glAttachShader(p, fs)
+    gl.glLinkProgram(p)
+    if not gl.glGetProgramiv(p, gl.GL_LINK_STATUS):
+        raise RuntimeError(gl.glGetProgramInfoLog(p))
+    gl.glDeleteShader(vs)
+    gl.glDeleteShader(fs)
+    return p
+
+
+def _upload_tex(data, w, h, old=0):
+    if old:
+        _delete_tex(old)
+    tid = int(gl.glGenTextures(1))
+    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
-    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, img.width, img.height, 0,
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, w, h, 0,
                     gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data)
     gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-    return int(tex)
+    return tid
 
 
-# ==================== SettingButton ====================
-class SettingButton:
-    BASE_RADIUS = 26
-    BASE_MARGIN = 16
-    BASE_TOP_GAP = 110
-    HOVER_SPEED = 15.0
-    MIN_VISIBLE_ALPHA = 0.45
-    HIDDEN_EPS = 0.02
-    # ===== 按钮可见区域 =====
-    BASE_ZONE_PAD_LEFT = 16
-    BASE_ZONE_PAD_TOP = 20
-    BASE_ZONE_BOTTOM = 530
-    
-    def __init__(self, pet):
-        self.pet = pet
-        self._ui_scale = 1.0
-        self._win_w = 800
-        self._win_h = 600
-        self._radius = self.BASE_RADIUS
-        self._margin = self.BASE_MARGIN
-        self._top_gap = self.BASE_TOP_GAP
-        self.hovered = False
-        self.hover_alpha = 0.0
-        self._last_tick = 0.0
-        self._tex_normal = 0
-        self._tex_muted = 0
-        self._icon_size = 0
-        self._gl_ready = False
-        self._next_rebuild_try = 0.0
-        self._zone_pad_left = self.BASE_ZONE_PAD_LEFT
-        self._zone_pad_top = self.BASE_ZONE_PAD_TOP
-        self._zone_bottom = self.BASE_ZONE_BOTTOM
-
-    def set_scale(self, ui_scale, win_w, win_h):
-        self._ui_scale = float(ui_scale) if ui_scale else 1.0
-        self._win_w = int(win_w)
-        self._win_h = int(win_h)
-        self._radius = max(20, int(round(self.BASE_RADIUS * self._ui_scale)))
-        self._margin = max(8, int(round(self.BASE_MARGIN * self._ui_scale)))
-        self._top_gap = max(40, int(round(self.BASE_TOP_GAP * self._ui_scale)))
-        target_icon = self._radius * 2
-        if (not self._gl_ready) or abs(target_icon - self._icon_size) >= 1:
-            self._rebuild_textures(target_icon)
-
-        self._zone_pad_left = max(8, int(round(self.BASE_ZONE_PAD_LEFT * self._ui_scale)))
-        self._zone_pad_top = max(8, int(round(self.BASE_ZONE_PAD_TOP * self._ui_scale)))
-        self._zone_bottom = max(200, int(round(self.BASE_ZONE_BOTTOM * self._ui_scale)))
-
-    def _show_zone(self):
-        cx, cy = self._get_center()
-        r = self._radius
-        x0 = cx - r - self._zone_pad_left
-        y0 = cy - r - self._zone_pad_top
-        x1 = float(self._win_w)                 # 右界＝窗口右缘
-        y1 = float(min(self._zone_bottom, self._win_h))
-        return x0, y0, x1, y1
-    
-    def _rebuild_textures(self, icon_size):
+def _delete_tex(tid):
+    try:
+        gl.glDeleteTextures([tid])
+    except Exception:
         try:
-            if self._tex_normal:
-                gl.glDeleteTextures([self._tex_normal])
-            if self._tex_muted:
-                gl.glDeleteTextures([self._tex_muted])
-            self._tex_normal = 0
-            self._tex_muted = 0
+            gl.glDeleteTextures(1, [tid])
         except Exception:
             pass
-        try:
-            self._tex_normal = _upload_texture(_draw_speaker_icon(icon_size, muted=False))
-            self._tex_muted = _upload_texture(_draw_speaker_icon(icon_size, muted=True))
-            self._icon_size = icon_size
-            self._gl_ready = True
-            print(f"[SettingButton] 纹理重建完成 size={icon_size}")
-        except Exception as e:
-            print(f"[SettingButton] 纹理创建失败: {e}")
-            self._gl_ready = False
 
-    def _get_center(self):
-        cx = self._win_w - self._margin - self._radius
-        cy = self._margin + self._radius + self._top_gap   # 下移后的中心
-        return cx, cy
 
-    def _hit_test(self, x, y):
-        if not self._gl_ready or self._radius <= 0:
-            return False
-        cx, cy = self._get_center()
-        dx, dy = x - cx, y - cy
-        return dx * dx + dy * dy <= self._radius * self._radius
+# ==================== 单个按钮 ====================
 
-    def _cursor_rel(self):
-        try:
-            if win32api is not None:
-                sx, sy = win32api.GetCursorPos()
-            else:
-                import pyautogui
-                sx, sy = pyautogui.position()
-        except Exception:
-            return None
-        win = getattr(self.pet, "window", None)
-        if win is None:
-            return None
-        try:
-            wx, wy = glfw.get_window_pos(win)
-        except Exception:
-            return None
-        return float(sx - wx), float(sy - wy)
+class _ButtonItem:
+    def __init__(self, bid, kind, get_state, on_click):
+        self.bid = bid
+        self.kind = kind
+        self.get_state = get_state
+        self.on_click = on_click
+        self.tex_off = 0
+        self.tex_on = 0
+        self.hover_t = 0.0
+        self.cx = 0.0
+        self.cy = 0.0
 
-    def update_hover(self, x, y):
-        try:
-            self.hovered = self._hit_test(float(x), float(y))
-        except Exception:
-            self.hovered = False
 
-    def try_click(self, x, y):
-        if self._hidden_by_chat():
-            return False
-        if self.hover_alpha <= 0.05:
-            return False
-        try:
-            hit = self._hit_test(float(x), float(y))
-        except Exception:
-            return False
-        if not hit:
-            return False
+# ==================== 按钮组 ====================
+
+class SettingButtonGroup:
+    def __init__(self, pet, ui_scale=1.0):
+        self.pet = pet
+        self.ui_scale = float(ui_scale)
+
+        self._win_w = 0
+        self._win_h = 0
+        self._radius = 0.0
+        self._tex_size = 0
+
+        self._program = 0
+        self._vao = 0
+        self._vbo = 0
+        self._gl_ready = False
+        self._next_rebuild_try = 0.0
+
+        self._group_alpha = 0.0
+        self._last_tick = 0.0
+        self.hovered = False
+
+        self._buttons = [
+            _ButtonItem("audio", "audio",
+                        lambda: is_audio_muted(),
+                        self._on_audio_click),
+            _ButtonItem("background", "background",
+                        lambda: is_background_enabled(),
+                        self._on_background_click),
+        ]
+
+    # ---------- 点击行为 ----------
+    def _on_audio_click(self):
         new_state = not is_audio_muted()
         set_audio_muted(new_state)
         print(f"[SettingButton] 音频静音 = {new_state}")
-        return True
+
+    def _on_background_click(self):
+        new_state = not is_background_enabled()
+        set_background_enabled(new_state)
+        bg = getattr(self.pet, "background", None)
+        if bg is not None:
+            bg.set_enabled(new_state)
+        print(f"[SettingButton] 背景启用 = {new_state}")
+
+    # ---------- 布局 ----------
+    def _relayout(self, win_w, win_h):
+        s = self.ui_scale
+        r = BASE_RADIUS * s
+        self._radius = r
+        cx = win_w - BASE_MARGIN * s - r
+        cy0 = BASE_MARGIN * s + r + BASE_TOP_GAP * s
+        step = r * 2.0 + BASE_BUTTON_GAP * s
+        for i, b in enumerate(self._buttons):
+            b.cx = cx
+            b.cy = cy0 + i * step
+
+    def _show_zone(self):
+        if not self._buttons:
+            return (0, 0, 0, 0)
+        r = self._radius
+        pad_x = ZONE_PADDING * self.ui_scale
+        pad_y = ZONE_PADDING_Y * self.ui_scale
+        first = self._buttons[0]
+        last = self._buttons[-1]
+        x0 = first.cx - r - pad_x
+        y0 = first.cy - r - pad_y
+        x1 = float(self._win_w)
+        y1 = last.cy + r + pad_y
+        return (x0, y0, x1, y1)
+    
+    def _hit_test(self, x, y):
+        r = self._radius
+        for b in self._buttons:
+            dx = x - b.cx
+            dy = y - b.cy
+            if dx * dx + dy * dy <= r * r:
+                return b
+        return None
 
     def _hidden_by_chat(self):
         chat = getattr(self.pet, "chat_window", None)
         return chat is not None and getattr(chat, "active", False)
 
-    def tick_and_draw(self, now, win_w, win_h, cursor_rel=None):
-        enforce_mixer_state()
+    def _cursor_rel(self):
+        try:
+            import glfw
+            win = getattr(self.pet, "window", None)
+            if win is None:
+                return None
+            sx, sy = glfw.get_cursor_pos(win)
+            wx, wy = glfw.get_window_pos(win)
+            return (sx, sy)
+        except Exception:
+            return None
 
+    # ---------- GL ----------
+    def _init_gl(self):
+        if self._program:
+            return True
+        try:
+            self._program = _compile(_VS, _FS)
+            self._vao = int(gl.glGenVertexArrays(1))
+            self._vbo = int(gl.glGenBuffers(1))
+            gl.glBindVertexArray(self._vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._vbo)
+            gl.glEnableVertexAttribArray(0)
+            gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, 16, None)
+            gl.glEnableVertexAttribArray(1)
+            gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, 16,
+                                     gl.ctypes.c_void_p(8))
+            gl.glBindVertexArray(0)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+            return True
+        except Exception as e:
+            print(f"[SettingButton] GL 初始化失败: {e}")
+            self._program = 0
+            return False
+
+    def _rebuild_textures(self):
+        diameter = int(max(8, self._radius * 2.0))
+        if diameter == self._tex_size and self._gl_ready:
+            return
+        try:
+            if not self._init_gl():
+                return
+            for b in self._buttons:
+                d0, w, h = _make_button_image(diameter, b.kind, False)
+                d1, _, _ = _make_button_image(diameter, b.kind, True)
+                b.tex_off = _upload_tex(d0, w, h, b.tex_off)
+                b.tex_on = _upload_tex(d1, w, h, b.tex_on)
+            self._tex_size = diameter
+            self._gl_ready = True
+        except Exception as e:
+            print(f"[SettingButton] 纹理重建失败: {e}")
+            self._gl_ready = False
+
+    def set_scale(self, ui_scale):
+        ui_scale = float(ui_scale)
+        if abs(ui_scale - self.ui_scale) < 1e-6:
+            return
+        self.ui_scale = ui_scale
+        self._tex_size = 0
+        self._gl_ready = False
+
+    # ---------- 每帧 ----------
+    def tick_and_draw(self, now, win_w, win_h, cursor_rel=None):
         if self._hidden_by_chat():
             self.hovered = False
+            self._group_alpha = 0.0
+            self._last_tick = now
             return
+
+        self.set_scale(getattr(self.pet, "ui_scale", self.ui_scale))
+
         if win_w != self._win_w or win_h != self._win_h:
             self._win_w = int(win_w)
             self._win_h = int(win_h)
+            self._relayout(self._win_w, self._win_h)
+            self._tex_size = 0
+            self._gl_ready = False
+
         if not self._gl_ready:
             if now >= self._next_rebuild_try:
                 self._next_rebuild_try = now + 1.0
-                self._rebuild_textures(self._radius * 2)
+                self._rebuild_textures()
             if not self._gl_ready:
                 return
-            
+
         if self._last_tick <= 0.0:
-            self._last_tick = now
             dt = 0.0
         else:
             dt = max(0.0, min(0.1, now - self._last_tick))
-            self._last_tick = now
+        self._last_tick = now
 
-        # ===== 每帧重算可见性 / 悬停 =====
         if cursor_rel is None:
-            cursor_rel = self._cursor_rel()   # 主循环未提供时的兜底路径
+            cursor_rel = self._cursor_rel()
+
         if cursor_rel is None:
             in_zone = False
             rx = ry = -1.0
@@ -316,72 +441,98 @@ class SettingButton:
             rx, ry = cursor_rel
             x0, y0, x1, y1 = self._show_zone()
             in_zone = (x0 <= rx <= x1) and (y0 <= ry <= y1)
-        self.hovered = in_zone and self._hit_test(rx, ry)
-        if not in_zone:
-            target = 0.0                      # 区域外（含窗口外）：完全隐藏
-        elif self.hovered:
-            target = 1.0                      # 悬停图标：高亮
-        else:
-            target = self.MIN_VISIBLE_ALPHA   # 区域内未悬停：半透明
-            
-        if dt > 0.0:
-            k = min(1.0, self.HOVER_SPEED * dt)
-            self.hover_alpha += (target - self.hover_alpha) * k
-            if abs(self.hover_alpha - target) < 0.005:
-                self.hover_alpha = target
-        alpha = self.hover_alpha
 
-        if alpha <= self.HIDDEN_EPS:
-            return  # 完全隐藏
+        hit = self._hit_test(rx, ry) if in_zone else None
+        self.hovered = hit is not None
 
-        cx, cy = self._get_center()
-        r = self._radius
-        tex = self._tex_muted if is_audio_muted() else self._tex_normal
-        if tex <= 0:
+        target = 1.0 if in_zone else 0.0
+        k = min(1.0, HOVER_SPEED * dt)
+        self._group_alpha += (target - self._group_alpha) * k
+        if self._group_alpha < HIDDEN_EPS and target == 0.0:
+            self._group_alpha = 0.0
             return
 
-        # === 保存 GL 状态，彻底隔离 ===
-        gl.glPushAttrib(gl.GL_ALL_ATTRIB_BITS)
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glPushMatrix()
-        gl.glLoadIdentity()
-        gl.glOrtho(0, self._win_w, self._win_h, 0, -1, 1)
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-        gl.glPushMatrix()
-        gl.glLoadIdentity()
+        for b in self._buttons:
+            bt = 1.0 if (hit is b) else 0.0
+            b.hover_t += (bt - b.hover_t) * k
 
-        gl.glUseProgram(0)
-        gl.glDisable(gl.GL_SCISSOR_TEST)
-        gl.glDisable(gl.GL_DEPTH_TEST)
-        gl.glDisable(gl.GL_CULL_FACE)
-        gl.glDisable(gl.GL_ALPHA_TEST)
-        try:
-            gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
-            gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
-            gl.glDisableClientState(gl.GL_COLOR_ARRAY)
-        except Exception:
-            pass
+        self._draw()
+
+    def _draw(self):
+        r = self._radius
+        verts = []
+        for b in self._buttons:
+            a = self._group_alpha * (BASE_VISIBLE + (1.0 - BASE_VISIBLE) * b.hover_t)
+            if a <= HIDDEN_EPS:
+                continue
+            verts.append((b, a))
+        if not verts:
+            return
+
         gl.glEnable(gl.GL_BLEND)
-        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)
-
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)  # 预乘
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glUseProgram(self._program)
+        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uScreen"),
+                       float(self._win_w), float(self._win_h))
+        gl.glUniform1i(gl.glGetUniformLocation(self._program, "uTex"), 0)
         gl.glActiveTexture(gl.GL_TEXTURE0)
-        gl.glEnable(gl.GL_TEXTURE_2D)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
-        gl.glTexEnvi(gl.GL_TEXTURE_ENV, gl.GL_TEXTURE_ENV_MODE, gl.GL_MODULATE)
+        gl.glBindVertexArray(self._vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._vbo)
 
-        gl.glColor4f(alpha, alpha, alpha, alpha)
-        x0, y0, x1, y1 = cx - r, cy - r, cx + r, cy + r
-        gl.glBegin(gl.GL_QUADS)
-        gl.glTexCoord2f(0.0, 1.0); gl.glVertex2f(x0, y0)
-        gl.glTexCoord2f(1.0, 1.0); gl.glVertex2f(x1, y0)
-        gl.glTexCoord2f(1.0, 0.0); gl.glVertex2f(x1, y1)
-        gl.glTexCoord2f(0.0, 0.0); gl.glVertex2f(x0, y1)
-        gl.glEnd()
+        for b, a in verts:
+            x0, y0 = b.cx - r, b.cy - r
+            x1, y1 = b.cx + r, b.cy + r
+            quad = np.array([
+                x0, y0, 0.0, 0.0,
+                x1, y0, 1.0, 0.0,
+                x1, y1, 1.0, 1.0,
+                x0, y0, 0.0, 0.0,
+                x1, y1, 1.0, 1.0,
+                x0, y1, 0.0, 1.0,
+            ], dtype=np.float32)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, quad.nbytes, quad, gl.GL_DYNAMIC_DRAW)
+
+            tex = b.tex_on if b.get_state() else b.tex_off
+            gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+            gl.glUniform1f(gl.glGetUniformLocation(self._program, "uAlpha"), float(a))
+            gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6)
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-        gl.glPopMatrix()
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glPopMatrix()
-        gl.glPopAttrib()
-        gl.glColor4f(1.0, 1.0, 1.0, 1.0)
+        gl.glBindVertexArray(0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+        gl.glUseProgram(0)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+    # ---------- 点击 ----------
+    def handle_click(self, x, y, *args, **kwargs):
+        if self._hidden_by_chat():
+            return False
+        if self._group_alpha <= 0.05 or not self._gl_ready:
+            return False
+        try:
+            b = self._hit_test(float(x), float(y))
+        except Exception:
+            return False
+        if b is None:
+            return False
+        try:
+            b.on_click()
+        except Exception as e:
+            print(f"[SettingButton] 点击处理失败: {e}")
+        return True
+
+    # 兼容可能的外部命名
+    handle_mouse_click = handle_click
+    on_click = handle_click
+
+    def destroy(self):
+        for b in self._buttons:
+            _delete_tex(b.tex_off)
+            _delete_tex(b.tex_on)
+            b.tex_off = b.tex_on = 0
+        self._gl_ready = False
+
+
+# 兼容旧类名
+SettingButton = SettingButtonGroup
