@@ -65,6 +65,17 @@ class WindowManager:
 
     def destroy(self):
         if self.window:
+            try:
+                glfw.hide_window(self.window)
+            except Exception:
+                pass
+            try:
+                hwnd = glfw.get_win32_window(self.window)
+                if hwnd:
+                    win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+            except Exception:
+                pass
+            
             glfw.make_context_current(self.window)
             glfw.destroy_window(self.window)
             self.window = None

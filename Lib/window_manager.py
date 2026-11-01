@@ -42,6 +42,7 @@ class WindowManager:
         self._wnd_proc_cb = None
         self._callbacks = {}
         self._glfw_initialized = False
+        self._shutting_down = False
 
     def ensure_glfw_initialized(self):
         if self._glfw_initialized:
@@ -127,8 +128,27 @@ class WindowManager:
             return 0, 0
 
     def destroy(self):
+        self._shutting_down = True
+
         try:
             if self.window:
+                try:
+                    glfw.hide_window(self.window)
+                except Exception:
+                    pass
+
+                try:
+                    hwnd = glfw.get_win32_window(self.window)
+                    if hwnd:
+                        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                except Exception:
+                    pass
+
+                try:
+                    glfw.poll_events()
+                except Exception:
+                    pass
+
                 glfw.destroy_window(self.window)
         except Exception:
             pass
@@ -145,7 +165,7 @@ class WindowManager:
             except Exception:
                 pass
             self._glfw_initialized = False
-
+        
     # ==================== Win32 ====================
 
     def _setup_win32_window(self):
@@ -194,7 +214,7 @@ class WindowManager:
         )
 
     def _wnd_proc_hook(self, hwnd, msg, wparam, lparam):
-        if msg == 0x0046 and lparam:  # WM_WINDOWPOSCHANGING
+        if msg == 0x0046 and lparam and not self._shutting_down:  # WM_WINDOWPOSCHANGING
             class WINDOWPOS(ctypes.Structure):
                 _fields_ = [
                     ("hwnd", ctypes.c_void_p),

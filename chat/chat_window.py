@@ -210,6 +210,7 @@ class IndependentChatWindow:
         # ---- 延迟初始化标志 ----
         self._window_created = False
         self._first_show = True
+        self._minimized_close_pending = False
         self.cursor_width = int(2 * self.scale)
         self.gl_renderer = None
         self.render_pipeline = None
@@ -219,9 +220,20 @@ class IndependentChatWindow:
         if self._window_created:
             return
 
+        self._minimized_close_pending = False
+
         # 1. 创建窗口 (内部会设置 self.win_mgr.window 并 make_context_current)
         self.win_mgr.create()
 
+        try:
+            if self.window:
+                glfw.set_window_iconify_callback(
+                    self.window,
+                    self._on_window_iconified
+                )
+        except Exception as e:
+            print(f"[ChatWindow] 注册最小化回调失败: {e}")
+            
         # 2. 初始化 GL 渲染器
         self.gl_renderer = ChatGLRenderer(
             self.window,
@@ -435,6 +447,23 @@ class IndependentChatWindow:
         if not self.active or not self._window_created:
             return
 
+        if self._minimized_close_pending:
+            self.mark_dirty()
+            return
+
+        self.chat_ctrl.process_updates()
+        self._sync_layout()
+
+        if self.scroll_manager.auto_scroll:
+            self.scroll_manager.scroll_to_bottom()
+
+        self.render_pipeline.schedule()
+
+        if self.render_pipeline.has_pending_data:
+            self.mark_dirty()
+
+        self.input_handler.update_auto_scroll()
+        
         self.chat_ctrl.process_updates()
         self._sync_layout()
         if self.scroll_manager.auto_scroll:
@@ -449,12 +478,16 @@ class IndependentChatWindow:
         if not self.active or not self._window_created:
             return False
 
+        if self._minimized_close_pending:
+            self._minimized_close_pending = False
+            self.hide()
+            return False
+
         rendered = self.render_pipeline.draw()
         if rendered:
             self.render_pipeline.clear_dirty()
-
         return rendered
-
+    
     # ---------- 窗口管理 ----------
     def _grab_focus(self):
         self.input_box.clear_selection()
@@ -465,6 +498,7 @@ class IndependentChatWindow:
         self.input_box.reset_cursor_blink()
 
     def show(self):
+        self._minimized_close_pending = False
         self._ensure_window_and_gl()  # 按需重建 Context
 
         # 业务重置
@@ -497,6 +531,8 @@ class IndependentChatWindow:
         self.mark_dirty()
 
     def hide(self):
+        self._minimized_close_pending = False
+        
         # 业务清理
         self.voice_ctrl.set_active(False)
         self.voice_ctrl.stop_and_release()
@@ -523,12 +559,16 @@ class IndependentChatWindow:
     def update_position(self):
         if not self._window_created:
             return
+        if self._minimized_close_pending:
+            return
         self.win_mgr.update_position()
-
+        
     def update_cursor_blink(self, current_time):
         if not self._window_created or not self.active:
             return
-
+        if self._minimized_close_pending:
+            return
+        
         editor = getattr(self, "character_editor", None)
         if editor is not None and getattr(editor, "visible", False):
             editor.update_cursor_blink(current_time)
@@ -567,6 +607,17 @@ class IndependentChatWindow:
             self._request_ui_update()
             self.mark_dirty()
 
+    def _on_window_iconified(self, window, iconified):
+        if not getattr(self, "_window_created", False):
+            return
+
+        if iconified:
+            self._minimized_close_pending = True
+            try:
+                glfw.post_empty_event()
+            except Exception:
+                pass
+            
     def cleanup(self):
         if self._window_created:
             self.hide()
