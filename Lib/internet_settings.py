@@ -26,23 +26,32 @@ _DEFAULT_SETTINGS = {
         {
             "id": "api_1",
             "display_name": "API 1",
+            "protocol": "tavily",
             "api_base": _TAVILY_DEFAULT_API_BASE,
             "api_key_enc": "",
             "enabled": True,
+            "request": {},
+            "response": {},
         },
         {
             "id": "api_2",
             "display_name": "API 2",
+            "protocol": "",
             "api_base": "",
             "api_key_enc": "",
             "enabled": False,
+            "request": {},
+            "response": {},
         },
         {
             "id": "api_3",
             "display_name": "API 3",
+            "protocol": "",
             "api_base": "",
             "api_key_enc": "",
             "enabled": False,
+            "request": {},
+            "response": {},
         },
     ],
     "sources": [
@@ -111,6 +120,12 @@ class InternetSettings:
                 if isinstance(existing.get("api_key_enc"), str):
                     base["api_key_enc"] = existing["api_key_enc"]
                 base["enabled"] = bool(existing.get("enabled", default["enabled"]))
+                if isinstance(existing.get("protocol"), str):
+                    base["protocol"] = existing["protocol"]
+                if isinstance(existing.get("request"), dict):
+                    base["request"] = copy.deepcopy(existing["request"])
+                if isinstance(existing.get("response"), dict):
+                    base["response"] = copy.deepcopy(existing["response"])
                 merged.append(base)
             else:
                 merged.append(copy.deepcopy(default))
@@ -249,6 +264,12 @@ class InternetSettings:
             return ""
         return secret_store.decrypt_text(token)
 
+    def get_api_config(self, api_id: str):
+        item = self._find_api(api_id)
+        if item is None:
+            return None
+        return copy.deepcopy(item)
+    
     def is_api_enabled(self, api_id: str) -> bool:
         item = self._find_api(api_id)
         if item is None:
@@ -310,7 +331,6 @@ class InternetSettings:
                 continue
 
             display = item.get("display_name", api_id)
-
             enabled = bool(incoming.get("enabled", False))
             api_base = str(incoming.get("api_base", "")).strip()
 
@@ -331,17 +351,36 @@ class InternetSettings:
                     except Exception:
                         return False, f"{display} 的密钥加密失败"
 
-            plans.append((item, api_base, enabled, key_enc))
-            
+            protocol = None
+            request_cfg = None
+            response_cfg = None
+            if "protocol" in incoming:
+                p = incoming.get("protocol")
+                if isinstance(p, str):
+                    protocol = p.strip()
+            if "request" in incoming and isinstance(incoming.get("request"), dict):
+                request_cfg = copy.deepcopy(incoming["request"])
+            if "response" in incoming and isinstance(incoming.get("response"), dict):
+                response_cfg = copy.deepcopy(incoming["response"])
+
+            plans.append((item, api_base, enabled, key_enc,
+                          protocol, request_cfg, response_cfg))
+
         with self._io_lock:
-            for item, api_base, enabled, key_enc in plans:
+            for item, api_base, enabled, key_enc, protocol, request_cfg, response_cfg in plans:
                 item["api_base"] = api_base
                 item["enabled"] = enabled
                 if key_enc is not None:
                     item["api_key_enc"] = key_enc
+                if protocol is not None:
+                    item["protocol"] = protocol
+                if request_cfg is not None:
+                    item["request"] = request_cfg
+                if response_cfg is not None:
+                    item["response"] = response_cfg
             self._save()
         return True, ""
-
+    
     # ---------- 来源 ----------
     def enabled_sources(self) -> list:
         sources = self._data.get("sources", [])

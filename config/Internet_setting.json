@@ -1,5 +1,5 @@
 {
-    "web_search_enabled": false,
+    "web_search_enabled": true,
     "proxy": "",
     "request_timeout_sec": 15,
     "max_results_per_source": 3,
@@ -12,23 +12,85 @@
         {
             "id": "api_1",
             "display_name": "API 1",
+            "protocol": "tavily",
             "api_base": "https://api.tavily.com",
             "api_key_enc": "",
-            "enabled": true
+            "enabled": true,
+            "request": {},
+            "response": {}
         },
         {
             "id": "api_2",
             "display_name": "API 2",
-            "api_base": "",
+            "protocol": "generic_http",
+            "api_base": "https://api.deepseek.com/v1/tools/search",
             "api_key_enc": "",
-            "enabled": false
+            "enabled": false,
+            "request": {
+                "method": "POST",
+                "url": "{api_base}",
+                "auth": {
+                    "type": "bearer"
+                },
+                "json": {
+                    "query": "{query}",
+                    "count": "{max_results}"
+                }
+            },
+            "response": {
+                "results_path": "results",
+                "title": "title",
+                "url": "url",
+                "snippet": [
+                    "snippet",
+                    "summary",
+                    "content"
+                ]
+            }
         },
         {
             "id": "api_3",
             "display_name": "API 3",
-            "api_base": "",
+            "protocol": "generic_http",
+            "api_base": "https://qianfan.baidubce.com/v2/ai_search/web_summary",
             "api_key_enc": "",
-            "enabled": false
+            "enabled": false,
+            "request": {
+                "method": "POST",
+                "url": "{api_base}",
+                "auth": {
+                    "type": "bearer"
+                },
+                "json": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "{query}"
+                        }
+                    ],
+                    "resource_type_filter": {
+                        "web": [
+                            {
+                                "top_k": "{max_results}"
+                            }
+                        ]
+                    }
+                }
+            },
+            "response": {
+                "results_path": [
+                    "references",
+                    "search_results",
+                    "data"
+                ],
+                "title": "title",
+                "url": "url",
+                "snippet": [
+                    "content",
+                    "snippet",
+                    "summary"
+                ]
+            }
         }
     ],
     "sources": [

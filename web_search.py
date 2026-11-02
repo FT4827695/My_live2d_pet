@@ -10,6 +10,7 @@ import time
 import threading
 from urllib.parse import urlparse
 import base64
+import json
 
 import requests
 import html
@@ -169,6 +170,199 @@ class BaseSourceAdapter:
     def fetch_article(self, info, max_chars):
         raise NotImplementedError
 
+# ==================== 通用 HTTP 声明式适配器 ====================
+
+class GenericHttpSearchAdapter(BaseSourceAdapter):
+    source_type = "generic_http"
+
+    _METHODS = ("GET", "POST")
+
+    def __init__(self, source_config, api_key=""):
+        super().__init__(source_config)
+        self.api_key = api_key or ""
+        self.api_base = str(self.config.get("api_base", "")).strip()
+        self.request_cfg = self.config.get("request") or {}
+        self.response_cfg = self.config.get("response") or {}
+        
+    # ---------- 渲染 ----------
+    def _render_value(self, value, query, max_results):
+        if isinstance(value, str):
+            if value == "{max_results}":
+                try:
+                    return int(max_results)
+                except (ValueError, TypeError):
+                    return value
+            if value == "{api_key}":
+                return self.api_key
+            if value == "{api_base}":
+                return self.api_base
+            return (
+                value
+                .replace("{query}", query)
+                .replace("{max_results}", str(max_results))
+                .replace("{api_key}", self.api_key)
+                .replace("{api_base}", self.api_base)
+            )
+        if isinstance(value, dict):
+            return {
+                k: self._render_value(v, query, max_results)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [self._render_value(v, query, max_results) for v in value]
+        return value
+    
+    # ---------- 认证 ----------
+    def _apply_auth(self, headers, params):
+        auth = self.request_cfg.get("auth") or {}
+        if not isinstance(auth, dict):
+            return
+        auth_type = str(auth.get("type", "none")).strip().lower()
+        if not self.api_key:
+            return
+        if auth_type == "bearer":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        elif auth_type == "header":
+            name = str(auth.get("name", "")).strip()
+            if name:
+                headers[name] = self.api_key
+        elif auth_type == "query_param":
+            name = str(auth.get("name", "")).strip()
+            if name:
+                params[name] = self.api_key
+
+    # ---------- 响应路径 ----------
+    @staticmethod
+    def _get_by_path(data, path):
+        if path is None or path == "":
+            return None
+        if isinstance(path, list):
+            for p in path:
+                value = GenericHttpSearchAdapter._get_by_path(data, p)
+                if value is not None:
+                    return value
+            return None
+        current = data
+        for part in str(path).split("."):
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except (ValueError, IndexError):
+                    return None
+            else:
+                return None
+            if current is None:
+                return None
+        return current
+
+    def _extract_str(self, item, path):
+        value = self._get_by_path(item, path)
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return ""
+        return str(value).strip()
+
+    def _parse_results(self, data, max_results):
+        items = self._get_by_path(
+            data, self.response_cfg.get("results_path", "results")
+        )
+        if not isinstance(items, list):
+            return []
+
+        title_path = self.response_cfg.get("title", "title")
+        url_path = self.response_cfg.get("url", "url")
+        snippet_path = self.response_cfg.get("snippet", "snippet")
+
+        results = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = self._extract_str(item, title_path)
+            url = self._extract_str(item, url_path)
+            snippet = self._extract_str(item, snippet_path)
+            if not url and not title:
+                continue
+            results.append({
+                "title": title,
+                "url": url,
+                "snippet": _strip_html(snippet),
+                "fetch_info": {"kind": "generic_url", "url": url},
+            })
+            if len(results) >= max_results:
+                break
+        return results
+
+    # ---------- 搜索 ----------
+    def search(self, query, max_results):
+        query = str(query or "").strip()
+        if not query:
+            raise SearchSourceError("query 为空")
+
+        method = str(self.request_cfg.get("method", "GET")).strip().upper()
+        if method not in self._METHODS:
+            raise SearchSourceError(f"不支持的 HTTP 方法: {method}")
+
+        url = self._render_value(
+            str(self.request_cfg.get("url", "")).strip(), query, max_results
+        )
+        if not url:
+            raise SearchSourceError("未配置 API 链接")
+
+        headers = self._render_value(
+            self.request_cfg.get("headers") or {}, query, max_results
+        )
+        params = self._render_value(
+            self.request_cfg.get("params") or {}, query, max_results
+        )
+        json_body = None
+        if "json" in self.request_cfg:
+            json_body = self._render_value(
+                self.request_cfg.get("json"), query, max_results
+            )
+
+        self._apply_auth(headers, params)
+
+        session = self._session()
+        try:
+            if method == "GET":
+                resp = session.get(
+                    url, headers=headers, params=params,
+                    timeout=self._timeout(),
+                )
+            else:
+                resp = session.post(
+                    url, headers=headers, params=params,
+                    json=json_body, timeout=self._timeout(),
+                )
+
+            if resp.status_code in (401, 403):
+                raise SearchSourceError(f"鉴权失败 (HTTP {resp.status_code})")
+            if resp.status_code == 429:
+                raise SearchSourceError("触发限流 (HTTP 429)")
+            if resp.status_code != 200:
+                raise SearchSourceError(f"HTTP {resp.status_code}")
+
+            try:
+                data = resp.json()
+            except Exception:
+                raise SearchSourceError("返回非 JSON 内容")
+
+            return self._parse_results(data, max_results)
+
+        except SearchSourceError:
+            raise
+        except requests.exceptions.RequestException as e:
+            raise SearchSourceError(f"网络异常: {e}")
+        except Exception as e:
+            raise SearchSourceError(f"请求失败: {e}")
+        finally:
+            session.close()
+
+    def fetch_article(self, info, max_chars):
+        return BingSiteSearchAdapter(self.config).fetch_article(info, max_chars)
 
 # ==================== Tavily 适配器 ====================
 
@@ -716,6 +910,24 @@ def _build_adapter(source_config):
     return cls(source_config)
 
 
+def _build_api_adapter(api_config, api_key=""):
+    if not isinstance(api_config, dict):
+        return None
+    protocol = str(api_config.get("protocol", "")).strip().lower()
+    if protocol != "generic_http":
+        return None
+    request_cfg = api_config.get("request") or {}
+    response_cfg = api_config.get("response") or {}
+    if not isinstance(request_cfg, dict):
+        return None
+    if not isinstance(response_cfg, dict):
+        return None
+    if not str(request_cfg.get("url", "")).strip():
+        return None
+    if not response_cfg.get("results_path"):
+        return None
+    return GenericHttpSearchAdapter(api_config, api_key=api_key)
+
 # ==================== 搜索引擎 ====================
 
 class WebSearchEngine:
@@ -750,10 +962,19 @@ class WebSearchEngine:
         tavily_fail_reason = None
 
         # ===== Step 3: Tavily 优先 =====
-        if settings.tavily_enabled and settings.is_api_enabled("api_1"):
+        api_1_cfg = settings.get_api_config("api_1") or {}
+        api_1_protocol = str(api_1_cfg.get("protocol", "")).strip().lower()
+        tavily_should_run = (
+            settings.tavily_enabled
+            and settings.is_api_enabled("api_1")
+            and api_1_protocol in ("", "tavily")
+        )
+
+        if tavily_should_run:
             raw_tavily, tavily_fail_reason = self._search_via_tavily(
                 query, per_source, aborted
             )
+            
             if raw_tavily:
                 return self._format_tavily_results(raw_tavily)
 
@@ -777,12 +998,68 @@ class WebSearchEngine:
 
             print(f"[WebSearch] Tavily 不可用（{tavily_fail_reason}），降级到通用搜索")
 
+        # ===== 中间层：API 1（generic_http）/ API 2 / API 3 =====
+        all_results = []
+        failed_sources = []
+        seen_urls = set()
+
+        for api_id in ("api_1", "api_2", "api_3"):
+            if aborted is not None and aborted():
+                break
+            if len(all_results) >= _MAX_TOTAL_RESULTS:
+                break
+            if api_id == "api_1" and api_1_protocol in ("", "tavily"):
+                continue
+            if not settings.is_api_enabled(api_id):
+                continue
+            cfg = settings.get_api_config(api_id)
+            if not cfg:
+                continue
+            adapter = _build_api_adapter(cfg, settings.get_api_key(api_id))
+            if adapter is None:
+                continue
+            display = cfg.get("display_name", api_id)
+            try:
+                results = adapter.search(query, per_source)
+            except SearchSourceError as e:
+                failed_sources.append(f"{display}（{e}）")
+                continue
+            except Exception as e:
+                print(f"[WebSearch] {api_id} 搜索异常: {e}")
+                failed_sources.append(f"{display}（搜索异常）")
+                continue
+
+            for r in results:
+                if len(all_results) >= _MAX_TOTAL_RESULTS:
+                    break
+                url = str(r.get("url", "")).strip().rstrip("/")
+                if url:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                ref_id = self._next_ref_id(api_id)
+                self._registry.register(ref_id, {
+                    "source_id": api_id,
+                    "fetch_info": r.get("fetch_info") or {},
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                })
+                all_results.append({
+                    "ref_id": ref_id,
+                    "source_name": display,
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "snippet": _strip_html(r.get("snippet", "")),
+                })
+
         # ===== 通用搜索兜底 =====
         sources = settings.enabled_sources()
-        if not sources:
+        if not sources and not all_results:
             detail_parts = []
             if tavily_fail_reason:
                 detail_parts.append(f"Tavily（{tavily_fail_reason}）")
+            if failed_sources:
+                detail_parts.extend(failed_sources)
             detail = "；".join(detail_parts) if detail_parts else "白名单中没有启用任何搜索来源。"
             return {
                 "ok": False,
@@ -791,9 +1068,6 @@ class WebSearchEngine:
                 "next_action": "请告知用户当前未配置可用的搜索网站。",
             }
 
-        all_results = []
-        failed_sources = []
-        seen_urls = set()
         seen_types = set()
 
         for source in sources:
@@ -964,6 +1238,102 @@ class WebSearchEngine:
                     "text": text,
                 }
 
+            # ===== API 2 / API 3 分支 =====
+            if source_id in ("api_2", "api_3"):
+                cfg = settings.get_api_config(source_id)
+                if not cfg:
+                    return {
+                        "ok": False,
+                        "error_type": "source_unavailable",
+                        "error": "该引用 ID 对应的 API 槽位当前不可用。",
+                        "next_action": "请重新调用 web_search 获取新的结果列表。",
+                    }
+                fetch_url = str(info.get("url", "")).strip()
+                if not fetch_url:
+                    return {
+                        "ok": False,
+                        "error_type": "missing_url",
+                        "error": "该搜索结果没有可读取的链接。",
+                        "next_action": "依据搜索摘要作答，不要重复重试。",
+                    }
+                if not self._is_basic_safe_url(fetch_url):
+                    return {
+                        "ok": False,
+                        "error_type": "url_not_allowed",
+                        "error": "该搜索结果链接不是合法的公网 http/https 地址。",
+                        "next_action": "仅依据搜索摘要作答。",
+                    }
+                adapter = GenericHttpSearchAdapter(
+                    cfg, api_key=settings.get_api_key(source_id)
+                )
+                try:
+                    text = adapter.fetch_article({"url": fetch_url}, max_chars)
+                except Exception as e:
+                    print(f"[WebSearch] {source_id} 正文读取异常: {e}")
+                    text = None
+                if not text:
+                    return {
+                        "ok": False,
+                        "error_type": "fetch_failed",
+                        "error": "正文抓取失败（页面可能为动态渲染或暂时不可用）。",
+                        "next_action": "依据搜索摘要作答，不要重复重试。",
+                    }
+                return {
+                    "ok": True,
+                    "title": info.get("title", ""),
+                    "url": info.get("url", ""),
+                    "source_name": cfg.get("display_name", source_id),
+                    "text": text,
+                }
+
+            # ===== API 1（generic_http）/ API 2 / API 3 分支 =====
+            if source_id in ("api_1", "api_2", "api_3"):
+                cfg = settings.get_api_config(source_id)
+                if not cfg:
+                    return {
+                        "ok": False,
+                        "error_type": "source_unavailable",
+                        "error": "该引用 ID 对应的 API 槽位当前不可用。",
+                        "next_action": "请重新调用 web_search 获取新的结果列表。",
+                    }
+                fetch_url = str(info.get("url", "")).strip()
+                if not fetch_url:
+                    return {
+                        "ok": False,
+                        "error_type": "missing_url",
+                        "error": "该搜索结果没有可读取的链接。",
+                        "next_action": "依据搜索摘要作答，不要重复重试。",
+                    }
+                if not self._is_basic_safe_url(fetch_url):
+                    return {
+                        "ok": False,
+                        "error_type": "url_not_allowed",
+                        "error": "该搜索结果链接不是合法的公网 http/https 地址。",
+                        "next_action": "仅依据搜索摘要作答。",
+                    }
+                adapter = GenericHttpSearchAdapter(
+                    cfg, api_key=settings.get_api_key(source_id)
+                )
+                try:
+                    text = adapter.fetch_article({"url": fetch_url}, max_chars)
+                except Exception as e:
+                    print(f"[WebSearch] {source_id} 正文读取异常: {e}")
+                    text = None
+                if not text:
+                    return {
+                        "ok": False,
+                        "error_type": "fetch_failed",
+                        "error": "正文抓取失败（页面可能为动态渲染或暂时不可用）。",
+                        "next_action": "依据搜索摘要作答，不要重复重试。",
+                    }
+                return {
+                    "ok": True,
+                    "title": info.get("title", ""),
+                    "url": info.get("url", ""),
+                    "source_name": cfg.get("display_name", source_id),
+                    "text": text,
+                }
+            
             # ===== 通用 sources 分支 =====
             adapter = self._adapter_for(source_id)
             if adapter is None:

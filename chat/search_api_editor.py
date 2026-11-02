@@ -1,5 +1,7 @@
 # chat/search_api_editor.py
 import os
+import copy
+import json
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -21,6 +23,98 @@ except Exception:
 DEFAULT_TITLE = "搜索 API 设置"
 API_COUNT = 3
 
+PROTOCOL_PRESETS = [
+    {
+        "id": "tavily",
+        "label": "Tavily（内置）",
+        "protocol": "tavily",
+        "request": {},
+        "response": {},
+        "default_base": "https://api.tavily.com",
+        "slots": ["api_1"],
+    },
+    {
+        "id": "tavily_compat",
+        "label": "Tavily 兼容 HTTP",
+        "protocol": "generic_http",
+        "request": {
+            "method": "POST",
+            "url": "{api_base}",
+            "auth": {"type": "bearer"},
+            "json": {"query": "{query}", "max_results": "{max_results}"},
+        },
+        "response": {
+            "results_path": "results",
+            "title": "title",
+            "url": "url",
+            "snippet": ["content", "snippet"],
+        },
+        "default_base": "https://api.tavily.com",
+        "slots": ["api_2", "api_3"],
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "protocol": "generic_http",
+        "request": {
+            "method": "POST",
+            "url": "{api_base}",
+            "auth": {"type": "bearer"},
+            "json": {"query": "{query}", "count": "{max_results}"},
+        },
+        "response": {
+            "results_path": "results",
+            "title": "title",
+            "url": "url",
+            "snippet": ["snippet", "summary", "content"],
+        },
+        "default_base": "https://api.deepseek.com/v1/tools/search",
+        "slots": ["api_1", "api_2", "api_3"],
+    },
+    {
+        "id": "baidu_web_summary",
+        "label": "百度 web_summary",
+        "protocol": "generic_http",
+        "request": {
+            "method": "POST",
+            "url": "{api_base}",
+            "auth": {"type": "bearer"},
+            "json": {
+                "messages": [{"role": "user", "content": "{query}"}],
+                "resource_type_filter": {"web": [{"top_k": "{max_results}"}]},
+            },
+        },
+        "response": {
+            "results_path": ["references", "search_results", "data"],
+            "title": "title",
+            "url": "url",
+            "snippet": ["content", "snippet", "summary"],
+        },
+        "default_base": "https://qianfan.baidubce.com/v2/ai_search/web_summary",
+        "slots": ["api_1", "api_2", "api_3"],
+    },
+    {
+        "id": "custom",
+        "label": "自定义 HTTP",
+        "protocol": "generic_http",
+        "request": {
+            "method": "POST",
+            "url": "{api_base}",
+            "auth": {"type": "bearer"},
+            "json": {"query": "{query}", "count": "{max_results}"}
+        },
+        "response": {
+            "results_path": "results",
+            "title": "title",
+            "url": "url",
+            "snippet": ["snippet", "content", "summary"]
+        },
+        "default_base": "",
+        "slots": ["api_1", "api_2", "api_3"],
+    },
+]
+
+PROTOCOL_BY_ID = {p["id"]: p for p in PROTOCOL_PRESETS}
 
 class SearchApiEditor:
 
@@ -188,17 +282,24 @@ class SearchApiEditor:
         self._request(True)
 
     def _make_empty_entry(self, i: int) -> Dict[str, Any]:
+        api_id = f"api_{i + 1}"
+        default_preset_id = "tavily" if api_id == "api_1" else "custom"
+        preset = PROTOCOL_BY_ID.get(default_preset_id, PROTOCOL_BY_ID["custom"])
         return {
-            "id": f"api_{i + 1}",
+            "id": api_id,
             "display_name": f"API {i + 1}",
             "api_base": "",
             "api_key_text": "",
             "has_key": False,
             "enabled": False,
+            "protocol": preset["protocol"],
+            "request": copy.deepcopy(preset["request"]),
+            "response": copy.deepcopy(preset["response"]),
+            "preset_id": default_preset_id,
             "link_box": None,
             "key_box": None,
         }
-
+    
     def _load_entries(self) -> None:
         self.entries = []
         if InternetSettings is None:
@@ -214,23 +315,115 @@ class SearchApiEditor:
         for item in ui_data:
             if isinstance(item, dict) and item.get("id"):
                 by_id[item["id"]] = item
+
         for i in range(API_COUNT):
             api_id = f"api_{i + 1}"
             item = by_id.get(api_id)
             if item is None:
                 self.entries.append(self._make_empty_entry(i))
-            else:
-                self.entries.append({
-                    "id": api_id,
-                    "display_name": str(item.get("display_name") or f"API {i + 1}"),
-                    "api_base": str(item.get("api_base", "")),
-                    "api_key_text": "",
-                    "has_key": bool(item.get("has_key", False)),
-                    "enabled": bool(item.get("enabled", False)),
-                    "link_box": None,
-                    "key_box": None,
-                })
+                continue
 
+            full_cfg = None
+            try:
+                full_cfg = InternetSettings.get_instance().get_api_config(api_id)
+            except Exception:
+                pass
+
+            protocol = ""
+            request_cfg: Dict[str, Any] = {}
+            response_cfg: Dict[str, Any] = {}
+            if full_cfg:
+                protocol = str(full_cfg.get("protocol", "")).strip().lower()
+                if isinstance(full_cfg.get("request"), dict):
+                    request_cfg = copy.deepcopy(full_cfg["request"])
+                if isinstance(full_cfg.get("response"), dict):
+                    response_cfg = copy.deepcopy(full_cfg["response"])
+
+            preset_id = self._detect_preset(api_id, protocol, request_cfg, response_cfg)
+
+            self.entries.append({
+                "id": api_id,
+                "display_name": str(item.get("display_name") or f"API {i + 1}"),
+                "api_base": str(item.get("api_base", "")),
+                "api_key_text": "",
+                "has_key": bool(item.get("has_key", False)),
+                "enabled": bool(item.get("enabled", False)),
+                "protocol": protocol,
+                "request": request_cfg,
+                "response": response_cfg,
+                "preset_id": preset_id,
+                "link_box": None,
+                "key_box": None,
+            })
+
+    @staticmethod
+    def _signature(obj) -> str:
+        try:
+            return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return ""
+
+    def _detect_preset(self, api_id, protocol, request_cfg, response_cfg) -> str:
+        available = [p for p in PROTOCOL_PRESETS if api_id in p.get("slots", [])]
+        if not available:
+            return "custom"
+
+        if protocol in ("", "tavily"):
+            for p in available:
+                if p["protocol"] == "tavily":
+                    return p["id"]
+            for p in available:
+                if p["id"] == "tavily_compat":
+                    return p["id"]
+            return "custom"
+
+        if protocol == "generic_http":
+            if not request_cfg and not response_cfg:
+                return "custom"
+            req_sig = self._signature(request_cfg)
+            resp_sig = self._signature(response_cfg)
+            for p in available:
+                if p["protocol"] != "generic_http":
+                    continue
+                if p["id"] == "custom":
+                    continue
+                if (self._signature(p["request"]) == req_sig
+                        and self._signature(p["response"]) == resp_sig):
+                    return p["id"]
+            return "custom"
+
+        return "custom"
+
+    def _cycle_protocol(self, i: int) -> None:
+        if i < 0 or i >= len(self.entries):
+            return
+        entry = self.entries[i]
+        api_id = entry.get("id", "")
+        available = [p for p in PROTOCOL_PRESETS if api_id in p.get("slots", [])]
+        if not available:
+            return
+
+        current_id = entry.get("preset_id") or "custom"
+        ids = [p["id"] for p in available]
+        if current_id not in ids:
+            current_id = ids[0]
+        next_idx = (ids.index(current_id) + 1) % len(ids)
+        next_preset = available[next_idx]
+
+        # 切换协议
+        entry["preset_id"] = next_preset["id"]
+        entry["protocol"] = next_preset["protocol"]
+        entry["request"] = copy.deepcopy(next_preset["request"])
+        entry["response"] = copy.deepcopy(next_preset["response"])
+
+        new_base = next_preset.get("default_base", "")
+        link_box = entry.get("link_box")
+        if link_box:
+            link_box.set_text(new_base)
+        entry["api_base"] = new_base
+
+        self._request(True)
+        
     def save(self) -> None:
         if not self.visible:
             return
@@ -252,6 +445,16 @@ class SearchApiEditor:
                 }
                 if key_text != "":
                     item["api_key"] = key_text
+
+                item = {
+                    "id": entry["id"],
+                    "api_base": link_text,
+                    "enabled": bool(entry.get("enabled", False)),
+                    "protocol": entry.get("protocol", ""),
+                    "request": copy.deepcopy(entry.get("request") or {}),
+                    "response": copy.deepcopy(entry.get("response") or {}),
+                }
+                
                 payload.append(item)
 
             ok, err = InternetSettings.get_instance().save_search_apis(payload)
@@ -332,8 +535,8 @@ class SearchApiEditor:
         min_group_gap = max(3, int(4 * scale))
 
         def item_h_fn(h, ih, lg):
-            return h + lg + ih + lg + ih
-
+            return h + lg + ih + lg + ih + lg + ih
+        
         def total_fn(h, ih, lg, gg):
             item = item_h_fn(h, ih, lg)
             return API_COUNT * item + (API_COUNT - 1) * gg
@@ -368,7 +571,11 @@ class SearchApiEditor:
             header_label_rect = (inner_x, y, inner_w - status_w - gap, header_h)
             header_status_rect = (inner_x + inner_w - status_w, y, status_w, header_h)
 
-            link_y = y + header_h + line_gap
+            proto_y = y + header_h + line_gap
+            proto_label_rect = (inner_x, proto_y, label_w, line_input_h)
+            proto_rect = (input_x, proto_y, input_w, line_input_h)
+
+            link_y = proto_y + line_input_h + line_gap
             link_label_rect = (inner_x, link_y, label_w, line_input_h)
             link_rect = (input_x, link_y, input_w, line_input_h)
 
@@ -380,13 +587,15 @@ class SearchApiEditor:
                 "header": header_rect,
                 "header_label": header_label_rect,
                 "header_status": header_status_rect,
+                "protocol_label": proto_label_rect,
+                "protocol": proto_rect,
                 "link_label": link_label_rect,
                 "link": link_rect,
                 "key_label": key_label_rect,
                 "key": key_rect,
             })
             y += item_h + group_gap
-
+            
         cancel_w = max(60, int(88 * scale))
         save_w = max(60, int(88 * scale))
         spacing = max(6, int(12 * scale))
@@ -476,6 +685,8 @@ class SearchApiEditor:
         for i, row in enumerate(self._row_rects):
             entry = self.entries[i]
             self._draw_header(draw, row, entry, label_font, status_font)
+            self._draw_field_label(draw, row["protocol_label"], "协议：", label_font)
+            self._draw_protocol_button(draw, row["protocol"], entry)
             self._draw_field_label(draw, row["link_label"], "地址：", label_font)
             self._draw_input(
                 draw, entry.get("link_box"), row["link"],
@@ -560,6 +771,42 @@ class SearchApiEditor:
         tx = x + w - text_w
         draw.text((tx, text_top), text, font=font, fill=(210, 210, 210, 230))
         
+    def _draw_protocol_button(self, draw, rect, entry):
+        if rect is None:
+            return
+        x, y, w, h = rect
+        radius = max(4, int(8 * self.scale))
+        draw.rounded_rectangle(
+            (x, y, x + w, y + h),
+            radius=radius,
+            fill=(240, 235, 220, 245),
+            outline=(150, 130, 100, 200),
+            width=max(1, int(1 * self.scale)),
+        )
+        font = self.get_font(self._input_font_size)
+        label = self._get_preset_label(entry)
+        text_h = self._ascent + self._descent
+        text_top = y + max(0, (h - text_h) // 2)
+        draw.text(
+            (x + self._input_pad, text_top),
+            label, font=font, fill=(40, 40, 30, 255),
+        )
+
+        arrow = "[ 切换 ]"
+        try:
+            arrow_w = self._text_width(font, arrow)
+        except Exception:
+            arrow_w = 10
+        ax = x + w - self._input_pad - arrow_w
+        draw.text((ax, text_top), arrow, font=font, fill=(120, 120, 100, 220))
+
+    def _get_preset_label(self, entry) -> str:
+        preset_id = entry.get("preset_id", "custom")
+        preset = PROTOCOL_BY_ID.get(preset_id)
+        if preset:
+            return preset["label"]
+        return "自定义 HTTP"
+
     def _draw_status(self, draw, rect, entry, font):
         x, y, w, h = rect
         key_box = entry.get("key_box")
@@ -735,11 +982,13 @@ class SearchApiEditor:
         for i, row in enumerate(self._row_rects):
             if self._rect_contains(row["header_label"], x, y):
                 return {"area": "search_api_editor_toggle", "index": i}
+            if self._rect_contains(row["protocol"], x, y):
+                return {"area": "search_api_editor_protocol", "index": i}
             if self._rect_contains(row["link"], x, y):
                 return {"area": "search_api_editor_link", "index": i}
             if self._rect_contains(row["key"], x, y):
                 return {"area": "search_api_editor_key", "index": i}
-
+            
         if self._rect_contains(self._panel_rect, x, y):
             return {"area": "search_api_editor_panel"}
 
@@ -790,6 +1039,13 @@ class SearchApiEditor:
                     box.reset_cursor_blink()
                 self._request(True)
                 return True
+            if self._rect_contains(row["header_label"], x, y):
+                self.entries[i]["enabled"] = not self.entries[i].get("enabled", False)
+                self._request(True)
+                return True
+            if self._rect_contains(row["protocol"], x, y):
+                self._cycle_protocol(i)
+                return True            
         return True
 
     def _get_index_by_pos(self, box, rect, x, y):
