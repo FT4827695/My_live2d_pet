@@ -78,6 +78,9 @@ class InputHandler:
 
         # 人设编辑弹窗（由 chat_window 注入）
         self.character_editor = None
+
+        # 搜索 API 编辑弹窗（由 chat_window 注入）
+        self.search_api_editor = None
         
     # ==================== 注册 ====================
     def register_callbacks(self):
@@ -197,6 +200,13 @@ class InputHandler:
             self._mark_dirty()
             return
 
+        api_editor = getattr(self, "search_api_editor", None)
+        if api_editor is not None and api_editor.visible:
+            api_editor.handle_mouse_button(button, action, mods, rx, ry)
+            self._request_update()
+            self._mark_dirty()
+            return
+        
         # 左键释放：通用清理
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.RELEASE:
             self._on_left_release_cleanup()
@@ -479,6 +489,10 @@ class InputHandler:
         editor = getattr(self, "character_editor", None)
         if editor is not None and editor.visible:
             return
+
+        api_editor = getattr(self, "search_api_editor", None)
+        if api_editor is not None and api_editor.visible:
+            return
         
         ctx = self._build_context()
         uploader = getattr(ctx, "doc_uploader", None)
@@ -626,6 +640,13 @@ class InputHandler:
             self._request_update()
             self._mark_dirty()
             return
+
+        api_editor = getattr(self, "search_api_editor", None)
+        if api_editor is not None and api_editor.visible:
+            api_editor.handle_key(key, scancode, action, mods)
+            self._request_update()
+            self._mark_dirty()
+            return
         
         # ESC 关闭菜单或窗口
         if key == glfw.KEY_ESCAPE:
@@ -750,6 +771,14 @@ class InputHandler:
                 self._mark_dirty()
             return
 
+        api_editor = getattr(self, "search_api_editor", None)
+        if api_editor is not None and api_editor.visible:
+            if codepoint >= 32:
+                api_editor.handle_char(chr(codepoint))
+                self._request_update()
+                self._mark_dirty()
+            return
+        
         if not self._get_input_focus():
             return
         
@@ -774,6 +803,15 @@ class InputHandler:
             self._mark_dirty()
             return
 
+        api_editor = getattr(self, "search_api_editor", None)
+        if api_editor is not None and api_editor.visible:
+            x, y = glfw.get_cursor_pos(win)
+            rx, ry = int(x), int(y)
+            api_editor.handle_scroll(rx, ry, xoff, yoff)
+            self._request_update()
+            self._mark_dirty()
+            return
+        
         if self._middle_press_active:
             self._middle_press_active = False
             self._voice_ctrl.cancel_long_press()

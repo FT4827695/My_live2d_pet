@@ -230,6 +230,9 @@ class MenuManager:
         # 清空对话外部回调
         self._on_clear_chat: Optional[Callable[[], None]] = None
 
+        # 打开搜索 API 编辑器回调
+        self.on_open_search_api_editor: Optional[Callable[[], None]] = None
+        
         # 设置菜单防误关保护时间
         self._settings_keep_open_until = 0.0
         self._settings_b_keep_open_until = 0.0
@@ -457,13 +460,18 @@ class MenuManager:
                         "enabled": True,
                     },
                     {
+                        "id": "search_api_settings",
+                        "text": indent + "搜索 API",
+                        "enabled": True,
+                    },
+                    {
                         "id": "internet_settings_file",
                         "text": indent + "网站和代理",
                         "enabled": True,
                     },
                 ]
             )
-        items.append({"id": "sep_internet", "text": "", "enabled": False})
+            items.append({"id": "sep_internet", "text": "", "enabled": False})
         
         # ---------- 设置项 ----------
         items.extend(
@@ -800,6 +808,12 @@ class MenuManager:
             return
         if cmd == "internet_settings_file":
             self._open_internet_settings_file()
+            return
+
+        if cmd == "search_api_settings":
+            if self.on_open_search_api_editor is not None:
+                self.on_open_search_api_editor()
+            self.hide_settings_menu(force=True)
             return
         
         if cmd == "character_file":

@@ -82,6 +82,7 @@ class RenderContext:
     msg_text_selection: Optional[Tuple] = None
     layout_snapshot: Optional[Any] = None
     character_editor: Optional[Any] = None
+    search_api_editor: Optional[Any] = None
 
     def get_text_width(self, text: str) -> float:
         return self.font.getlength(text) if hasattr(self.font, 'getlength') else self.font.getsize(text)[0]
@@ -639,6 +640,11 @@ class ChatUIRenderer:
             editor_cursor = character_editor.render(img, draw, ctx)
             return RenderResult(cursor_rect=editor_cursor)
 
+        api_editor = getattr(ctx, "search_api_editor", None)
+        if api_editor is not None and getattr(api_editor, "visible", False):
+            api_editor.render(img, draw, ctx)
+            return RenderResult(cursor_rect=None)
+        
         # 返回光标矩形（宽度留空，由窗口补全）
         return RenderResult(cursor_rect=cursor_rect)
     
@@ -679,6 +685,10 @@ class ChatUI:
         if character_editor is not None and getattr(character_editor, "visible", False):
             return character_editor.hit_test(x, y, ctx, is_click=is_click)
 
+        api_editor = getattr(ctx, "search_api_editor", None)
+        if api_editor is not None and getattr(api_editor, "visible", False):
+            return api_editor.hit_test(x, y, ctx, is_click=is_click)
+        
         # 计算所有按钮位置（与渲染保持一致）
         hdr = compute_header_rects(ctx.width, ctx.scale)
         close_x, close_y, close_size, _ = hdr["close"]

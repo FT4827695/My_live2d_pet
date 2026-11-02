@@ -7,8 +7,30 @@
     "max_snippet_chars": 2048,
     "max_article_chars": 4096,
     "tavily_enabled": true,
-    "tavily_api_key": "",
     "tavily_fallback_to_general": true,
+    "search_apis": [
+        {
+            "id": "api_1",
+            "display_name": "API 1",
+            "api_base": "https://api.tavily.com",
+            "api_key_enc": "",
+            "enabled": true
+        },
+        {
+            "id": "api_2",
+            "display_name": "API 2",
+            "api_base": "",
+            "api_key_enc": "",
+            "enabled": false
+        },
+        {
+            "id": "api_3",
+            "display_name": "API 3",
+            "api_base": "",
+            "api_key_enc": "",
+            "enabled": false
+        }
+    ],
     "sources": [
         {
             "id": "bing_news",

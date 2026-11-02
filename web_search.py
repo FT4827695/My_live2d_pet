@@ -174,16 +174,23 @@ class BaseSourceAdapter:
 
 class TavilyAdapter(BaseSourceAdapter):
     source_type = "tavily"
-    SEARCH_URL = "https://api.tavily.com/search"
-    EXTRACT_URL = "https://api.tavily.com/extract"
+    _DEFAULT_BASE = "https://api.tavily.com"
+    _API_SLOT_ID = "api_1"
 
     def __init__(self, source_config=None):
         super().__init__(source_config or {"id": "tavily", "display_name": "Tavily"})
 
+    def _api_base(self):
+        settings = InternetSettings.get_instance()
+        base = settings.get_api_base(self._API_SLOT_ID).strip()
+        if not base:
+            base = self._DEFAULT_BASE
+        return base.rstrip("/")
+
     def _headers(self):
         settings = InternetSettings.get_instance()
         headers = {"Content-Type": "application/json"}
-        api_key = settings.tavily_api_key
+        api_key = settings.get_api_key(self._API_SLOT_ID)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         else:
@@ -198,7 +205,7 @@ class TavilyAdapter(BaseSourceAdapter):
         }
         try:
             resp = session.post(
-                self.SEARCH_URL,
+                f"{self._api_base()}/search",
                 headers=self._headers(),
                 json=payload,
                 timeout=self._timeout(),
@@ -249,7 +256,7 @@ class TavilyAdapter(BaseSourceAdapter):
         session = self._session()
         try:
             resp = session.post(
-                self.EXTRACT_URL,
+                f"{self._api_base()}/extract",
                 headers=self._headers(),
                 json={"urls": [url]},
                 timeout=self._timeout(),
@@ -280,7 +287,6 @@ class TavilyAdapter(BaseSourceAdapter):
         if not str(raw).strip():
             return None
         return _truncate(str(raw), max_chars)
-
 
 # ==================== Bing site: 通用 / 兜底适配器 ====================
 
@@ -744,7 +750,7 @@ class WebSearchEngine:
         tavily_fail_reason = None
 
         # ===== Step 3: Tavily 优先 =====
-        if settings.tavily_enabled:
+        if settings.tavily_enabled and settings.is_api_enabled("api_1"):
             raw_tavily, tavily_fail_reason = self._search_via_tavily(
                 query, per_source, aborted
             )
