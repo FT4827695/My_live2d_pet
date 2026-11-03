@@ -20,7 +20,8 @@ class InputHandler:
                  grab_focus, hide_window,
                  scale, width, height,
                  input_h, input_y_offset, send_btn_width,
-                 input_visible_lines, msg_top, msg_bottom_margin):
+                 input_visible_lines, msg_top, msg_bottom_margin,
+                 resize_controller=None):
         # 核心组件
         self._window = window
         self._ui = ui
@@ -81,6 +82,9 @@ class InputHandler:
 
         # 搜索 API 编辑弹窗（由 chat_window 注入）
         self.search_api_editor = None
+
+        # 聊天窗口大小拖曳控制器（由 chat_window 注入）
+        self._resize_controller = resize_controller
         
     # ==================== 注册 ====================
     def register_callbacks(self):
@@ -124,6 +128,8 @@ class InputHandler:
         return (focus, anchor)
 
     def reset_state(self):
+        if self._resize_controller:
+            self._resize_controller.cancel_resize_drag()
         self._pressed_button = None
         self._selecting = False
         self._auto_scroll_dir = 0
@@ -147,6 +153,52 @@ class InputHandler:
                     self._mark_dirty()
         except Exception:
             pass
+
+    def update_layout_metrics(
+        self,
+        width,
+        height,
+        input_h=None,
+        input_y_offset=None,
+        send_btn_width=None,
+        input_visible_lines=None,
+        msg_top=None,
+        msg_bottom_margin=None,
+    ):
+        self._width = int(width)
+        self._height = int(height)
+
+        if input_h is not None:
+            self._input_h = int(input_h)
+
+        if input_y_offset is not None:
+            self._input_y_offset = int(input_y_offset)
+
+        if send_btn_width is not None:
+            self._send_btn_width = int(send_btn_width)
+
+        if input_visible_lines is not None:
+            self._input_visible_lines = int(input_visible_lines)
+
+        if msg_top is not None:
+            self._msg_top = int(msg_top)
+
+        if msg_bottom_margin is not None:
+            self._msg_bottom_margin = int(msg_bottom_margin)
+
+        # 重新计算输入框区域
+        self._input_top = self._height - self._input_h - self._input_y_offset
+        self._input_bottom = self._input_top + self._input_h
+        self._input_x = int(12 * self._scale)
+        self._input_w = (
+            self._width
+            - int(12 * self._scale) * 2
+            - self._send_btn_width
+            - int(16 * self._scale)
+        )
+
+        # 消息区域底部
+        self._msg_bottom = self._height - self._input_h - self._msg_bottom_margin        
 
     def _drop_callback(self, window, paths):
         if not self._get_active():
@@ -205,6 +257,14 @@ class InputHandler:
             api_editor.handle_mouse_button(button, action, mods, rx, ry)
             self._request_update()
             self._mark_dirty()
+            return
+
+        # ---------- 聊天窗口大小拖曳状态拦截 ----------
+        if self._resize_controller and self._resize_controller.is_resize_press_active:
+            if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.RELEASE:
+                self._resize_controller.end_resize_drag(rx, ry)
+                self._request_update()
+                self._mark_dirty()
             return
         
         # 左键释放：通用清理
@@ -324,6 +384,24 @@ class InputHandler:
             self._request_update()
             self._mark_dirty()
             return
+
+        # ---- 聊天窗口大小拖曳点 ----
+        if area in ('resize_grip_left', 'resize_grip_right'):
+            if self._resize_controller:
+                side = hit.get('side')
+                if side not in ("left", "right"):
+                    side = "right" if area == "resize_grip_right" else "left"
+
+                # 开始拖曳前清理可能存在的选中状态
+                self._selected_messages.clear()
+                self.clear_msg_selection()
+                self._input_box.clear_selection()
+                self._selecting = False
+
+                if self._resize_controller.begin_resize_drag(side, rx, ry):
+                    self._request_update()
+                    self._mark_dirty()
+            return         
         # ---- 关闭按钮 ----
         if area == 'close_btn':
             self._hide_window()
@@ -493,6 +571,11 @@ class InputHandler:
         api_editor = getattr(self, "search_api_editor", None)
         if api_editor is not None and api_editor.visible:
             return
+
+        # ---------- 聊天窗口大小拖曳移动 ----------
+        if self._resize_controller and self._resize_controller.is_resize_press_active:
+            self._resize_controller.move_resize_drag(rx, ry)
+            return
         
         ctx = self._build_context()
         uploader = getattr(ctx, "doc_uploader", None)
@@ -566,6 +649,19 @@ class InputHandler:
 
     # ==================== 自动滚动（tick 中调用） ====================
     def update_auto_scroll(self):
+        # ---------- 聊天窗口大小拖曳兜底 ----------
+        if self._resize_controller and self._resize_controller.is_resize_press_active:
+            try:
+                if glfw.get_mouse_button(self._window, glfw.MOUSE_BUTTON_LEFT) == glfw.RELEASE:
+                    self._resize_controller.end_resize_drag()
+                    self._request_update()
+                    self._mark_dirty()
+                    return
+            except Exception:
+                pass
+
+            # 拖曳期间不做普通自动滚动
+            return        
         now = time.time()
         # ---- 输入框自动滚动 ----
         if self._selecting and self._auto_scroll_dir != 0:
@@ -646,6 +742,14 @@ class InputHandler:
             api_editor.handle_key(key, scancode, action, mods)
             self._request_update()
             self._mark_dirty()
+            return
+
+        # ---------- 聊天窗口大小拖曳拦截 ----------
+        if self._resize_controller and self._resize_controller.is_resize_press_active:
+            if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
+                self._resize_controller.cancel_resize_drag()
+                self._request_update()
+                self._mark_dirty()
             return
         
         # ESC 关闭菜单或窗口

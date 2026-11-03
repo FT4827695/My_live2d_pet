@@ -82,6 +82,12 @@ def is_background_enabled():
 def set_background_enabled(v):
     _settings.set("background.enabled", bool(v))
 
+def is_chat_resize_unlocked():
+    return _settings.get_bool("chat.resize_unlocked", False)
+
+
+def set_chat_resize_unlocked(v):
+    _settings.set("chat.resize_unlocked", bool(v))
 
 # ==================== 图标生成 ====================
 
@@ -132,12 +138,43 @@ def _draw_picture(d, cx, cy, s, color, enabled):
         d.line([(x0 - s * 0.04, y1 + s * 0.04), (x1 + s * 0.04, y0 - s * 0.04)],
                fill=color, width=lw)
 
+def _draw_resize_unlock(d, cx, cy, s, color, active):
+    lw = max(2, int(s * 0.07))
+
+    # 外层大方框
+    x0, y0 = cx - s * 0.34, cy - s * 0.28
+    x1, y1 = cx + s * 0.34, cy + s * 0.28
+    d.rounded_rectangle(
+        [x0, y0, x1, y1],
+        radius=s * 0.08,
+        outline=color,
+        width=lw
+    )
+
+    # 内层小方框
+    ix0, iy0 = cx - s * 0.15, cy - s * 0.12
+    ix1, iy1 = cx + s * 0.15, cy + s * 0.12
+
+    if active:
+        d.rounded_rectangle(
+            [ix0, iy0, ix1, iy1],
+            radius=s * 0.05,
+            fill=color
+        )
+    else:
+        inner_lw = max(2, int(s * 0.05))
+        d.rounded_rectangle(
+            [ix0, iy0, ix1, iy1],
+            radius=s * 0.05,
+            outline=color,
+            width=inner_lw
+        )
 
 _ICON_DRAWERS = {
     "audio": _draw_speaker,
     "background": _draw_picture,
+    "chat_resize": _draw_resize_unlock,
 }
-
 
 def _make_button_image(diameter, kind, active):
     size = max(8, int(diameter * SS))
@@ -278,6 +315,9 @@ class SettingButtonGroup:
         self._last_tick = 0.0
         self.hovered = False
 
+        # 聊天窗口大小解锁提示冷却
+        self._last_resize_tip_time = 0.0
+
         self._buttons = [
             _ButtonItem("audio", "audio",
                         lambda: is_audio_muted(),
@@ -285,6 +325,9 @@ class SettingButtonGroup:
             _ButtonItem("background", "background",
                         lambda: is_background_enabled(),
                         self._on_background_click),
+            _ButtonItem("chat_resize", "chat_resize",
+                        lambda: is_chat_resize_unlocked(),
+                        self._on_chat_resize_click),
         ]
 
     # ---------- 点击行为 ----------
@@ -301,6 +344,54 @@ class SettingButtonGroup:
             bg.set_enabled(new_state)
         print(f"[SettingButton] 背景启用 = {new_state}")
 
+    def _on_chat_resize_click(self):
+        new_state = not is_chat_resize_unlocked()
+        set_chat_resize_unlocked(new_state)
+
+        if new_state:
+            self._show_resize_shift_tip()
+
+    def _show_resize_shift_tip(self):
+        now = time.time()
+
+        if now - getattr(self, "_last_resize_tip_time", 0.0) < 10.0:
+            return
+
+        self._last_resize_tip_time = now
+        self._queue_pet_bubble("按Shift可以等比例调整哦")
+
+
+    def _queue_pet_bubble(self, text):
+        pet = getattr(self, "pet", None)
+        if pet is None:
+            return
+
+        try:
+            if hasattr(pet, "queue_bubble"):
+                pet.queue_bubble(text)
+                return
+        except Exception as e:
+            print(f"[SettingButton] queue_bubble 失败: {e}")
+
+        try:
+            bubble = (
+                getattr(pet, "bubble_controller", None)
+                or getattr(pet, "bubble_ctrl", None)
+                or getattr(pet, "bubble", None)
+            )
+
+            if bubble is not None and hasattr(bubble, "show"):
+                bubble.show(text)
+                return
+        except Exception as e:
+            print(f"[SettingButton] bubble.show 失败: {e}")
+
+        try:
+            if hasattr(pet, "show_bubble"):
+                pet.show_bubble(text)
+        except Exception as e:
+            print(f"[SettingButton] show_bubble 失败: {e}")
+        
     # ---------- 布局 ----------
     def _relayout(self, win_w, win_h):
         s = self.ui_scale
@@ -394,13 +485,19 @@ class SettingButtonGroup:
             self._gl_ready = False
 
     def set_scale(self, ui_scale):
-        ui_scale = float(ui_scale)
+        try:
+            ui_scale = float(ui_scale)
+        except Exception:
+            ui_scale = 1.0
+
         if abs(ui_scale - self.ui_scale) < 1e-6:
             return
+
         self.ui_scale = ui_scale
+
         self._tex_size = 0
         self._gl_ready = False
-
+        
     # ---------- 每帧 ----------
     def tick_and_draw(self, now, win_w, win_h, cursor_rel=None):
         if self._hidden_by_chat():

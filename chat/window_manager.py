@@ -119,6 +119,24 @@ class WindowManager:
             self.x, self.y = new_x, new_y
             glfw.set_window_pos(self.window, self.x, self.y)
 
+    def resize(self, width, height, x=None, y=None):
+        self.width = int(width)
+        self.height = int(height)
+
+        if self.window:
+            try:
+                glfw.set_window_size(self.window, self.width, self.height)
+            except Exception as e:
+                print(f"[WindowManager] resize 失败: {e}")
+
+            if x is not None and y is not None:
+                self.x = int(x)
+                self.y = int(y)
+                try:
+                    glfw.set_window_pos(self.window, self.x, self.y)
+                except Exception as e:
+                    print(f"[WindowManager] resize 定位失败: {e}")
+                
     # ==================== 显示 / 隐藏 ====================
 
     def show(self):

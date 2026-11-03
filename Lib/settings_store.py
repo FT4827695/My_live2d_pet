@@ -29,9 +29,11 @@ SETTING_PATH = os.path.join(CONFIG_DIR, "setting.json")
 
 DEFAULTS = {
     "version": 1,
+
     "audio": {
         "muted": False,
     },
+
     "background": {
         "enabled": False,
         "file": "background.png",
@@ -39,8 +41,14 @@ DEFAULTS = {
         "dim_on_chat": True,
         "dim_alpha": 0.45,
     },
-}
 
+    "chat": {
+        "resize_unlocked": False,
+        "custom_width": 0,
+        "custom_height": 0,
+        "custom_display_scale": 0.0,
+    },
+}
 
 def _deep_merge(base, user):
     out = copy.deepcopy(base)

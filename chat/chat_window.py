@@ -1,4 +1,6 @@
 import glfw
+import time
+import math
 
 from .docs_uploader import DocsUploader
 from .voice_input import VoiceController
@@ -17,6 +19,7 @@ from prompt import get_character_name
 from .message_layout import MessageLayoutManager
 from .character_editor import CharacterEditor
 from .search_api_editor import SearchApiEditor
+from settings_store import get_settings
 
 class IndependentChatWindow:
     # ---------- 窗口状态代理 ----------
@@ -44,6 +47,14 @@ class IndependentChatWindow:
     def selecting(self):
         return self.input_handler.selecting if self.input_handler else False
 
+    @property
+    def is_resize_press_active(self):
+        return self._resize_press_active
+
+    @property
+    def is_resize_dragging(self):
+        return self._resize_dragging
+
     @selecting.setter
     def selecting(self, value):
         if self.input_handler:
@@ -65,7 +76,15 @@ class IndependentChatWindow:
         self.pet = pet_instance
 
         from display_config import compute_chat_metrics
+
+        self._display_scale = display_scale
         self.scale, self.width, self.height, self.font_sizes = compute_chat_metrics(display_scale)
+
+        # 默认聊天窗口尺寸
+        self._default_chat_size = (self.width, self.height)
+
+        # 自定义聊天窗口尺寸，初始化时应用
+        self._load_saved_chat_size()
 
         self.win_mgr = WindowManager(
             self.main_window, self.width, self.height, self.scale
@@ -105,6 +124,27 @@ class IndependentChatWindow:
         )
         # 消息选择
         self.selected_messages = set()
+
+        # 聊天窗口大小拖曳点状态
+        self._resize_grip_side = "right"
+
+        # 聊天窗口大小拖曳状态
+        self._resize_press_active = False
+        self._resize_dragging = False
+        self._resize_drag_side = None
+        self._resize_drag_start_pos = None
+        self._resize_drag_start_size = None
+        self._resize_target_size = None
+        self._resize_drag_threshold = 4
+
+        # 拖曳点双击恢复默认状态
+        self._last_grip_click_time = 0.0
+        self._last_grip_click_side = None
+
+        # 聊天窗口大小拖曳预览节流
+        self._resize_preview_interval = 0.12
+        self._last_resize_preview_time = 0.0
+        self._last_resize_preview_target = None
 
         # 创建输入框
         input_width = self.width - self.input_padding * 2 - self.send_btn_width
@@ -285,6 +325,7 @@ class IndependentChatWindow:
             input_visible_lines=self.input_visible_lines,
             msg_top=self.msg_top,
             msg_bottom_margin=self.msg_bottom_margin,
+            resize_controller=self,
         )
         self.input_handler.register_callbacks()
 
@@ -321,6 +362,148 @@ class IndependentChatWindow:
         self._window_created = True
         glfw.make_context_current(self.main_window)
 
+    def _get_screen_size(self):
+        try:
+            import win32api
+            return int(win32api.GetSystemMetrics(0)), int(win32api.GetSystemMetrics(1))
+        except Exception:
+            pass
+
+        try:
+            monitor = glfw.get_primary_monitor()
+            mode = glfw.get_video_mode(monitor)
+            if hasattr(mode, "size"):
+                return int(mode.size.width), int(mode.size.height)
+            return int(mode.width), int(mode.height)
+        except Exception:
+            return 1920, 1080
+
+    def _is_shift_pressed(self):
+        try:
+            win = getattr(self.win_mgr, "window", None)
+            if win is None:
+                return False
+
+            left_shift = glfw.get_key(win, glfw.KEY_LEFT_SHIFT)
+            right_shift = glfw.get_key(win, glfw.KEY_RIGHT_SHIFT)
+
+            return (
+                left_shift == glfw.PRESS
+                or right_shift == glfw.PRESS
+            )
+        except Exception:
+            return False
+
+    def _compute_shift_locked_target(self, start_w, start_h, dx, dy):
+        side = getattr(self, "_resize_drag_side", None)
+        if side not in ("left", "right"):
+            side = getattr(self, "_resize_grip_side", "right")
+
+        start_w = max(1, int(start_w))
+        start_h = max(1, int(start_h))
+
+        # ---------- 计算期望缩放系数 ----------
+        if side == "right":
+            # 右上角拖曳：锚点为左下角
+            anchor_x, anchor_y = 0, start_h
+            start_x, start_y = start_w, 0
+            current_x, current_y = start_w + int(dx), int(dy)
+        else:
+            # 左上角拖曳：锚点为右下角
+            anchor_x, anchor_y = start_w, start_h
+            start_x, start_y = 0, 0
+            current_x, current_y = int(dx), int(dy)
+
+        base_dist = math.hypot(start_x - anchor_x, start_y - anchor_y)
+        current_dist = math.hypot(current_x - anchor_x, current_y - anchor_y)
+
+        if base_dist <= 0:
+            factor = 1.0
+        else:
+            factor = current_dist / base_dist
+
+        # ---------- 最小缩放系数：不能小于默认安全尺寸 ----------
+        default_w, default_h = getattr(self, "_default_chat_size", (start_w, start_h))
+
+        min_factor = max(
+            float(default_w) / float(start_w),
+            float(default_h) / float(start_h),
+        )
+
+        # ---------- 最大缩放系数：不能超过屏幕边界 ----------
+        max_factor = factor
+
+        try:
+            screen_w, screen_h = self._get_screen_size()
+            margin = 8
+
+            if self._window_created and getattr(self.win_mgr, "window", None) is not None:
+                x, y = glfw.get_window_pos(self.win_mgr.window)
+
+                if side == "right":
+                    # 右上角拖曳：向右扩展
+                    max_w = max(start_w, screen_w - x - margin)
+                else:
+                    # 左上角拖曳：向左扩展
+                    max_w = max(start_w, x + start_w - margin)
+
+                # 向上扩展
+                max_h = max(start_h, y + start_h - margin)
+
+                max_factor = min(
+                    float(max_w) / float(start_w),
+                    float(max_h) / float(start_h),
+                )
+            else:
+                max_factor = min(
+                    float(screen_w - margin * 2) / float(start_w),
+                    float(screen_h - margin * 2) / float(start_h),
+                )
+
+        except Exception:
+            max_factor = max(min_factor, factor)
+
+        # ---------- 钳制 ----------
+        lower = min_factor
+        upper = max(min_factor, max_factor)
+
+        factor = max(lower, min(factor, upper))
+
+        target_w = int(round(start_w * factor))
+        target_h = int(round(start_h * factor))
+
+        return target_w, target_h        
+    
+    def _load_saved_chat_size(self):
+        try:
+            settings = get_settings()
+            cw = int(settings.get("chat.custom_width", 0) or 0)
+            ch = int(settings.get("chat.custom_height", 0) or 0)
+            cs = float(settings.get("chat.custom_display_scale", 0.0) or 0.0)
+        except Exception:
+            return
+
+        if cw <= 0 or ch <= 0:
+            return
+
+        if abs(cs - getattr(self, "_display_scale", 0.0)) > 1e-6:
+            return
+
+        default_w, default_h = getattr(self, "_default_chat_size", (self.width, self.height))
+
+        try:
+            screen_w, screen_h = self._get_screen_size()
+        except Exception:
+            screen_w, screen_h = 1920, 1080
+
+        margin = 16
+
+        max_w = max(self.width, screen_w - margin)
+        max_h = max(self.height, screen_h - margin)
+
+        self.width = max(self.width, min(cw, max_w))
+        self.height = max(self.height, min(ch, max_h))        
+
     # ---------- 辅助方法 ----------
     def _calc_gear_rect(self):
         return compute_header_rects(self.width, self.scale)["gear"]
@@ -353,6 +536,478 @@ class IndependentChatWindow:
 
         return clean_lines
 
+    def _is_resize_unlocked(self):
+        try:
+            return get_settings().get_bool("chat.resize_unlocked", False)
+        except Exception:
+            return False
+
+    def _update_resize_grip_side(self):
+        side = "right"
+
+        try:
+            chat_win = getattr(self.win_mgr, "window", None)
+            pet_win = getattr(self, "main_window", None)
+    
+            if pet_win is None:
+                pet_win = getattr(self.win_mgr, "main_window", None)
+
+            if chat_win is None or pet_win is None:
+                self._resize_grip_side = side
+                return
+
+            chat_x, chat_y = glfw.get_window_pos(chat_win)
+            chat_w, chat_h = glfw.get_window_size(chat_win)
+
+            pet_x, pet_y = glfw.get_window_pos(pet_win)
+            pet_w, pet_h = glfw.get_window_size(pet_win)
+
+            chat_center_x = chat_x + chat_w * 0.5
+            pet_center_x = pet_x + pet_w * 0.5
+
+            if chat_center_x >= pet_center_x:
+                side = "right"
+            else:
+                side = "left"
+
+        except Exception:
+            side = "right"
+
+        self._resize_grip_side = side
+
+
+    def begin_resize_drag(self, side, x, y):
+        if not self._is_resize_unlocked():
+            return False
+
+        if side not in ("left", "right"):
+            return False
+
+        if self._resize_press_active:
+            return False
+
+        try:
+            if self.menu_manager.context_menu.get("visible"):
+                return False
+            if self.menu_manager.settings_menu.get("visible"):
+                return False
+            settings_menu_b = getattr(self.menu_manager, "settings_menu_b", None)
+            if settings_menu_b is not None and settings_menu_b.get("visible"):
+                return False
+        except Exception:
+            pass
+
+        try:
+            if getattr(self.character_editor, "visible", False):
+                return False
+            if getattr(self.search_api_editor, "visible", False):
+                return False
+        except Exception:
+            pass
+
+        self._resize_press_active = True
+        self._resize_dragging = False
+        self._resize_drag_side = side
+        self._resize_drag_start_pos = (int(x), int(y))
+        self._resize_drag_start_size = (self.width, self.height)
+        self._resize_target_size = (self.width, self.height)
+
+        # 预览节流状态重置
+        self._last_resize_preview_time = 0.0
+        self._last_resize_preview_target = None
+
+        return True
+
+
+    def _tick_resize_preview(self):
+        if not self._resize_dragging:
+            return
+
+        target = self._resize_target_size
+        if target is None:
+            return
+
+        # 目标尺寸没变化时不重复渲染
+        if target == self._last_resize_preview_target:
+            return
+
+        now = time.time()
+        if now - self._last_resize_preview_time < self._resize_preview_interval:
+            return
+
+        self._last_resize_preview_time = now
+        self._last_resize_preview_target = target
+
+        self._request_ui_update()
+        self.mark_dirty()
+
+        if self.render_pipeline:
+            self.render_pipeline.schedule()
+        
+    def move_resize_drag(self, x, y):
+        if not self._resize_press_active:
+            return False
+
+        if self._resize_drag_start_pos is None:
+            return False
+
+        sx, sy = self._resize_drag_start_pos
+        dx = int(x) - sx
+        dy = int(y) - sy
+
+        if not self._resize_dragging:
+            if abs(dx) <= self._resize_drag_threshold and abs(dy) <= self._resize_drag_threshold:
+                return False
+
+            self._resize_dragging = True
+
+            self._last_resize_preview_time = 0.0
+            self._last_resize_preview_target = None
+        
+        start_w, start_h = self._resize_drag_start_size
+
+        # ---------- 按住 Shift：锁定当前宽高比 ----------
+        if self._is_shift_pressed():
+            target_w, target_h = self._compute_shift_locked_target(
+                start_w,
+                start_h,
+                dx,
+                dy
+            )
+
+            self._resize_target_size = (int(target_w), int(target_h))
+            return True
+
+        # ---------- 默认：自由宽高 ----------
+        if self._resize_drag_side == "right":
+            target_w = start_w + dx
+        else:
+            target_w = start_w - dx
+
+        target_h = start_h - dy
+
+        self._resize_target_size = self._clamp_resize_target(target_w, target_h)
+        return True
+
+    def end_resize_drag(self, x=None, y=None):
+        if not getattr(self, "_resize_press_active", False):
+            return False
+
+        was_dragging = getattr(self, "_resize_dragging", False)
+        target = getattr(self, "_resize_target_size", None)
+        start = getattr(self, "_resize_drag_start_size", None)
+        side = getattr(self, "_resize_drag_side", None)
+
+        if side not in ("left", "right"):
+            side = getattr(self, "_resize_grip_side", "right")
+
+        # 重置拖曳状态
+        self._resize_press_active = False
+        self._resize_dragging = False
+        self._resize_drag_side = None
+        self._resize_drag_start_pos = None
+        self._resize_drag_start_size = None
+        self._resize_target_size = None
+
+        # 重置预览节流状态
+        try:
+            self._last_resize_preview_time = 0.0
+            self._last_resize_preview_target = None
+        except Exception:
+            pass
+
+        now = time.time()
+
+        # ---------- 没有真正拖曳：处理双击 ----------
+        if not was_dragging:
+            if (
+                side
+                and self._last_grip_click_side == side
+                and now - self._last_grip_click_time < 0.45
+            ):
+                self._last_grip_click_time = 0.0
+                self._last_grip_click_side = None
+                self._reset_resize_to_default(side)
+                return True
+
+            self._last_grip_click_time = now
+            self._last_grip_click_side = side
+
+            self._request_ui_update(urgent=True)
+            self.mark_dirty()
+
+            if self.render_pipeline:
+                self.render_pipeline.schedule()
+
+            return True
+
+        # ---------- 发生过真正拖曳：清除双击记忆，应用目标尺寸 ----------
+        self._last_grip_click_time = 0.0
+        self._last_grip_click_side = None
+
+        applied = False
+
+        if target and start:
+            target_w = int(target[0])
+            target_h = int(target[1])
+            start_w = int(start[0])
+            start_h = int(start[1])
+
+            if (target_w, target_h) != (start_w, start_h):
+                applied = self._apply_resize_target(target_w, target_h, side, save=True)
+
+        if not applied:
+            self._request_ui_update(urgent=True)
+            self.mark_dirty()
+
+            if self.render_pipeline:
+                self.render_pipeline.schedule()
+
+        return True
+
+    def _reset_resize_to_default(self, side=None):
+        default_w, default_h = getattr(self, "_default_chat_size", (self.width, self.height))
+
+        if side not in ("left", "right"):
+            side = getattr(self, "_resize_grip_side", "right")
+
+        applied = self._apply_resize_target(int(default_w), int(default_h), side, save=True)
+
+        if not applied:
+            self._request_ui_update(urgent=True)
+            self.mark_dirty()
+
+            if self.render_pipeline:
+                self.render_pipeline.schedule()
+            
+    def cancel_resize_drag(self):
+        if not self._resize_press_active:
+            return False
+
+        print("[Resize] drag canceled")
+
+        self._resize_press_active = False
+        self._resize_dragging = False
+        self._resize_drag_side = None
+        self._resize_drag_start_pos = None
+        self._resize_drag_start_size = None
+        self._resize_target_size = None
+
+        # 预览节流状态重置
+        self._last_resize_preview_time = 0.0
+        self._last_resize_preview_target = None
+
+        # 取消拖曳后恢复一次渲染
+        self._request_ui_update(urgent=True)
+        self.mark_dirty()
+        return True        
+
+    def _clamp_resize_target(self, w, h):
+        start_w, start_h = self._resize_drag_start_size or (self.width, self.height)
+        min_w, min_h = getattr(self, "_default_chat_size", (self.width, self.height))
+
+        w = max(min_w, int(w))
+        h = max(min_h, int(h))
+
+        try:
+            screen_w, screen_h = self._get_screen_size()
+            margin = 8
+
+            if self._window_created and getattr(self.win_mgr, "window", None) is not None:
+                x, y = glfw.get_window_pos(self.win_mgr.window)
+
+                if w > start_w:
+                    if self._resize_drag_side == "left":
+                       max_w = x + start_w - margin
+                    else:
+                        max_w = screen_w - x - margin
+
+                    w = min(w, max(start_w, int(max_w)))
+
+                if h > start_h:
+                    # 底边固定，向上扩展
+                    max_h = y + start_h - margin
+                    h = min(h, max(start_h, int(max_h)))
+            else:
+                if w > start_w:
+                    w = min(w, max(start_w, screen_w - margin * 2))
+
+                if h > start_h:
+                    h = min(h, max(start_h, screen_h - margin * 2))
+
+        except Exception:
+            pass
+
+        return int(w), int(h)
+
+    def _apply_resize_target(self, new_w, new_h, side, save=True):
+        new_w = int(new_w)
+        new_h = int(new_h)
+
+        if new_w <= 0 or new_h <= 0:
+            return False
+
+        old_w, old_h = self.width, self.height
+
+        if new_w == old_w and new_h == old_h:
+            return False
+
+        # ---------- 计算新的窗口位置 ----------
+        new_x = None
+        new_y = None
+
+        if self._window_created and getattr(self.win_mgr, "window", None) is not None:
+            try:
+                old_x, old_y = glfw.get_window_pos(self.win_mgr.window)
+            except Exception:
+                old_x, old_y = self.win_mgr.x, self.win_mgr.y
+
+            if side == "left":
+                # 左上角拖曳：右边缘固定
+                new_x = old_x + old_w - new_w
+            else:
+                # 右上角拖曳：左边缘固定
+                new_x = old_x
+
+            # 底边固定
+            new_y = old_y + old_h - new_h
+
+            try:
+                screen_w, screen_h = self._get_screen_size()
+                new_x = max(0, min(int(new_x), max(0, screen_w - new_w)))
+                new_y = max(0, min(int(new_y), max(0, screen_h - new_h)))
+            except Exception:
+                pass
+    
+        # ---------- 更新聊天窗口自身尺寸 ----------
+        self.width = new_w
+        self.height = new_h
+
+        # ---------- 更新 GLFW 窗口 ----------
+        try:
+           if hasattr(self.win_mgr, "resize"):
+                self.win_mgr.resize(new_w, new_h, new_x, new_y)
+           else:
+                self.win_mgr.width = new_w
+                self.win_mgr.height = new_h
+
+                if getattr(self.win_mgr, "window", None) is not None:
+                    glfw.set_window_size(self.win_mgr.window, new_w, new_h)
+
+                    if new_x is not None and new_y is not None:
+                        self.win_mgr.x = new_x
+                        self.win_mgr.y = new_y
+                        glfw.set_window_pos(self.win_mgr.window, new_x, new_y)
+        except Exception as e:
+            print(f"[Resize] 窗口尺寸应用失败: {e}")
+
+        # ---------- 更新渲染管线 ----------
+        try:
+            if self.render_pipeline is not None and hasattr(self.render_pipeline, "set_size"):
+                self.render_pipeline.set_size(new_w, new_h)
+        except Exception as e:
+            print(f"[Resize] RenderPipeline 尺寸更新失败: {e}")
+
+        # ---------- 更新输入框宽度 ----------
+        try:
+            new_input_width = new_w - self.input_padding * 2 - self.send_btn_width
+            self.input_box.set_width(new_input_width)
+        except Exception as e:
+            print(f"[Resize] 输入框宽度更新失败: {e}")
+
+        # ---------- 更新滚动区域 ----------
+        try:
+            self.scroll_manager.width = new_w
+            self.scroll_manager.height = new_h
+            self.scroll_manager.invalidate_cache()
+            self.scroll_manager.scrollbar_rect = None
+            self.scroll_manager.thumb_rect = None
+        except Exception:
+            pass
+
+        # ---------- 重新折行消息 ----------
+        try:
+            self._sync_layout()
+        except Exception:
+            pass
+
+        # ---------- 滚动位置钳制 ----------
+        try:
+            if self.scroll_manager.auto_scroll:
+                self.scroll_manager.scroll_to_bottom()
+            else:
+                self.scroll_manager.scroll(0)
+        except Exception:
+            pass
+
+        # ---------- 更新菜单管理器 ----------
+        try:
+            self.menu_manager.width = new_w
+            self.menu_manager.height = new_h
+        except Exception:
+            pass
+
+        # ---------- 更新编辑弹窗 ----------
+        for editor_attr in ("character_editor", "search_api_editor"):
+            editor = getattr(self, editor_attr, None)
+            if editor is None:
+                continue
+
+            try:
+                editor.width = new_w
+                editor.height = new_h
+            except Exception:
+                pass
+
+            try:
+                if hasattr(editor, "_layout_key"):
+                    editor._layout_key = None
+            except Exception:
+                pass
+
+        # ---------- 更新输入处理器命中区域 ----------
+        try:
+            if self.input_handler is not None and hasattr(self.input_handler, "update_layout_metrics"):
+                self.input_handler.update_layout_metrics(new_w, new_h)
+        except Exception:
+            pass
+
+        # ---------- 强制静态背景重画 ----------
+        try:
+            self.ui_renderer._static_key = None
+        except Exception:
+            pass
+
+        # ---------- 更新拖曳点方向 ----------
+        try:
+            self._update_resize_grip_side()
+        except Exception:
+            pass
+
+        # ---------- 请求渲染 ----------
+        self._request_ui_update(urgent=True)
+        self.mark_dirty()
+
+        if self.render_pipeline:
+            self.render_pipeline.schedule()
+
+       # ---------- 保存自定义尺寸 ----------
+        if save:
+            try:
+                settings = get_settings()
+                settings.set("chat.custom_width", new_w, save=False)
+                settings.set("chat.custom_height", new_h, save=False)
+                settings.set(
+                    "chat.custom_display_scale",
+                    float(getattr(self, "_display_scale", 0.0)),
+                    save=False
+                )
+                settings.save()
+            except Exception as e:
+                print(f"[Resize] 保存自定义尺寸失败: {e}")
+
+        return True
+    
     def _sync_layout(self):
         if getattr(self, "layout_manager", None) is None:
             return None
@@ -392,7 +1047,13 @@ class IndependentChatWindow:
             settings_menu=self.menu_manager.settings_menu,
             hovered_menu_item=self.menu_manager.hovered_menu_item,
             settings_menu_b=self.menu_manager.settings_menu_b,
-            msg_top=self.msg_top,
+            # 聊天窗口大小拖曳点
+            resize_unlocked=self._is_resize_unlocked(),
+            resize_grip_side=self._resize_grip_side,
+            # 聊天窗口大小拖曳预览
+            resize_dragging=self._resize_dragging,
+            resize_target_size=self._resize_target_size if self._resize_dragging else None,
+            resize_start_size=self._resize_drag_start_size if self._resize_dragging else None,            msg_top=self.msg_top,
             input_h=self.input_h,
             msg_bottom_margin=self.msg_bottom_margin,
             input_y_offset=self.input_y_offset,
@@ -467,30 +1128,34 @@ class IndependentChatWindow:
         if self._minimized_close_pending:
             self.mark_dirty()
             return
+    
+        # ---------- 聊天窗口大小拖曳冻结 ----------
+        if getattr(self, "_resize_press_active", False):
+            if self.input_handler:
+                self.input_handler.update_auto_scroll()
 
+            if getattr(self, "_resize_press_active", False):
+                if hasattr(self, "_tick_resize_preview"):
+                    self._tick_resize_preview()
+
+            return
+
+        # ---------- 正常业务刷新 ----------
         self.chat_ctrl.process_updates()
         self._sync_layout()
 
         if self.scroll_manager.auto_scroll:
             self.scroll_manager.scroll_to_bottom()
 
-        self.render_pipeline.schedule()
+        if self.render_pipeline:
+            self.render_pipeline.schedule()
 
-        if self.render_pipeline.has_pending_data:
-            self.mark_dirty()
+            if self.render_pipeline.has_pending_data:
+                self.mark_dirty()
 
-        self.input_handler.update_auto_scroll()
+        if self.input_handler:
+            self.input_handler.update_auto_scroll()
         
-        self.chat_ctrl.process_updates()
-        self._sync_layout()
-        if self.scroll_manager.auto_scroll:
-            self.scroll_manager.scroll_to_bottom()
-
-        self.render_pipeline.schedule()
-        if self.render_pipeline.has_pending_data:
-            self.mark_dirty()
-        self.input_handler.update_auto_scroll()
-
     def draw(self):
         if not self.active or not self._window_created:
             return False
@@ -540,6 +1205,7 @@ class IndependentChatWindow:
             
         # 窗口显示（位置计算 + show_window + active=True）
         self.win_mgr.show()
+        self._update_resize_grip_side()
 
         # 焦点 + 业务
         self._grab_focus()
@@ -589,6 +1255,7 @@ class IndependentChatWindow:
         if self._minimized_close_pending:
             return
         self.win_mgr.update_position()
+        self._update_resize_grip_side()
         
     def update_cursor_blink(self, current_time):
         if not self._window_created or not self.active:

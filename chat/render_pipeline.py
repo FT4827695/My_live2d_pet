@@ -69,6 +69,18 @@ class RenderPipeline:
         self._pending_tex_update = True
         glfw.post_empty_event()
 
+    def set_size(self, width, height):
+        self._width = int(width)
+        self._height = int(height)
+
+        # 丢弃旧尺寸下的待上传图像
+        self._pending_image_data = None
+        self._current_cursor_rect = None
+
+        # 允许尽快重新渲染
+        self._pending_tex_update = True
+        self._last_tex_update_time = 0.0        
+
     # ==================== 调度 ====================
 
     def schedule(self):

@@ -39,6 +39,33 @@ def compute_header_rects(width: int, scale: float) -> Dict[str, Any]:
         "gear":      (gear_x,  close_y, btn, btn),
     }
 
+def compute_resize_grip_rects(width: int, height: int, scale: float, side: str = "right"):
+    result = {}
+
+    if side not in ("left", "right", "both"):
+        return result
+
+    grip_size = max(10, int(14 * scale))
+    pad = max(2, int(3 * scale))
+
+    if side in ("left", "both"):
+        result["left"] = (
+            pad,
+            pad,
+            pad + grip_size,
+            pad + grip_size,
+        )
+
+    if side in ("right", "both"):
+        result["right"] = (
+            width - pad - grip_size,
+            pad,
+            width - pad,
+            pad + grip_size,
+        )
+
+    return result
+
 _UI_CHARACTER_NAME = get_character_name()
 
 def refresh_character_name():
@@ -66,6 +93,16 @@ class RenderContext:
     settings_menu: dict         # 由 MenuManager 提供（菜单A）
     settings_menu_b: Optional[dict] = None   # 由 MenuManager 提供（菜单B，语音设置）
     hovered_menu_item: Optional[Tuple[str, Any]] = None  # (menu_type, item_id)
+
+    # 聊天窗口大小拖曳点状态
+    resize_unlocked: bool = False
+    resize_grip_side: str = "right"
+
+    # 聊天窗口大小拖曳预览状态
+    resize_dragging: bool = False
+    resize_target_size: Optional[Tuple[int, int]] = None
+    resize_start_size: Optional[Tuple[int, int]] = None
+
     # 布局常量（由窗口计算好传入）
     msg_top: int = 0
     input_h: int = 0
@@ -568,6 +605,12 @@ class ChatUIRenderer:
             draw.text((x_status, y_status), ctx.recording_status_text,
                       font=status_font, fill=(255, 100, 100, 255))
 
+        # ---------- 聊天窗口大小拖曳点 ----------
+        self._render_resize_grips(draw, ctx)
+
+        # ---------- 聊天窗口大小拖曳预览 ----------
+        self._render_resize_preview(draw, ctx)
+
         # ---------- 菜单渲染（通用方法复用） ----------
         menu_font = self.get_font(ctx.font_sizes['menu'])
         settings_menu_w = int(
@@ -661,6 +704,138 @@ class ChatUIRenderer:
         img = img.transpose(Image.FLIP_TOP_BOTTOM)
         return img, result
 
+    def _render_resize_grips(self, draw: ImageDraw.ImageDraw, ctx: RenderContext):
+        if not getattr(ctx, "resize_unlocked", False):
+            return
+
+        if ctx.context_menu.get('visible'):
+            return
+
+        if ctx.settings_menu.get('visible'):
+            return
+
+        settings_menu_b = getattr(ctx, "settings_menu_b", None)
+        if settings_menu_b is not None and settings_menu_b.get('visible'):
+            return
+
+        # 编辑弹窗打开时不显示拖曳点
+        character_editor = getattr(ctx, "character_editor", None)
+        if character_editor is not None and getattr(character_editor, "visible", False):
+            return
+
+        api_editor = getattr(ctx, "search_api_editor", None)
+        if api_editor is not None and getattr(api_editor, "visible", False):
+            return
+
+        side = getattr(ctx, "resize_grip_side", "right")
+        grips = compute_resize_grip_rects(ctx.width, ctx.height, ctx.scale, side)
+
+        if not grips:
+            return
+
+        # 外层木框上的浅色角标
+        dragging = getattr(ctx, "resize_dragging", False)
+
+        if dragging:
+            fill_color = (255, 170, 80, 235)
+        else:
+            fill_color = (255, 80, 80, 230)
+
+        outline_color = (120, 86, 40, 255)
+    
+        for key, rect in grips.items():
+            x0, y0, x1, y1 = rect
+
+            if key == "left":
+                # 左上角三角形
+                points = [
+                    (x0, y0),
+                    (x1, y0),
+                    (x0, y1),
+                ]
+            else:
+                # 右上角三角形
+                points = [
+                    (x1, y0),
+                    (x0, y0),
+                    (x1, y1),
+                ]
+
+            draw.polygon(points, fill=fill_color)
+            draw.line(points + [points[0]], fill=outline_color, width=max(1, int(1 * ctx.scale)))
+        
+    def _render_resize_preview(self, draw: ImageDraw.ImageDraw, ctx: RenderContext):
+        if not getattr(ctx, "resize_dragging", False):
+            return
+
+        target = getattr(ctx, "resize_target_size", None)
+        if not target:
+            return
+
+        start = getattr(ctx, "resize_start_size", None)
+
+        try:
+            tw_target, th_target = int(target[0]), int(target[1])
+        except Exception:
+            return
+
+        if start:
+            try:
+                sw, sh = int(start[0]), int(start[1])
+                dw = tw_target - sw
+                dh = th_target - sh
+                text = f"{tw_target} x {th_target}  ({dw:+d}, {dh:+d})"
+            except Exception:
+                text = f"{tw_target} x {th_target}"
+        else:
+            text = f"{tw_target} x {th_target}"
+
+        font_size = max(14, int(ctx.font_sizes.get("status", 20)))
+        font = self.get_font(font_size)
+
+        bbox = font.getbbox(text)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        pad = max(4, int(4 * ctx.scale))
+        panel_w = tw + pad * 2
+        panel_h = th + pad * 2
+
+        side = getattr(ctx, "resize_grip_side", "right")
+        grips = compute_resize_grip_rects(ctx.width, ctx.height, ctx.scale, side)
+        grip = grips.get(side)
+
+        if grip:
+            gx0, gy0, gx1, gy1 = grip
+    
+            if side == "right":
+                x = gx1 - panel_w
+            else:
+                x = gx0
+
+            y = gy1 + max(2, int(2 * ctx.scale))
+        else:
+            x = (ctx.width - panel_w) // 2
+            y = int(40 * ctx.scale)
+
+        # 边界钳制
+        edge = max(2, int(2 * ctx.scale))
+        x = max(edge, min(int(x), ctx.width - panel_w - edge))
+        y = max(edge, min(int(y), ctx.height - panel_h - edge))
+
+        draw.rectangle(
+            [x, y, x + panel_w, y + panel_h],
+            fill=(25, 32, 26, 215),
+            outline=(255, 220, 160, 220),
+            width=max(1, int(1 * ctx.scale))
+        )
+
+        draw.text(
+            (x + pad, y + pad - bbox[1]),
+            text,
+            font=font,
+            fill=(255, 240, 200, 255)
+        )
 
 class ChatUI:
     def __init__(self):
@@ -737,6 +912,18 @@ class ChatUI:
                     if item.get('enabled', True):
                         return {'area': 'settings_menu_b', 'item_id': item['id']}
             return {'area': 'settings_menu_b_bg'}
+
+        # - 聊天窗口大小拖曳点 -
+        if getattr(ctx, "resize_unlocked", False):
+            side = getattr(ctx, "resize_grip_side", "right")
+            grips = compute_resize_grip_rects(ctx.width, ctx.height, ctx.scale, side)
+            for grip_side, rect in grips.items():
+                x0, y0, x1, y1 = rect
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    return {
+                        'area': f'resize_grip_{grip_side}',
+                        'side': grip_side,
+                    }
 
         # --- 齿轮和关闭按钮 ---
         if gear_x <= x <= gear_x + gear_size and gear_y <= y <= gear_y + gear_size:
