@@ -1,7 +1,7 @@
 {
   "version": 1,
   "audio": {
-    "muted": false
+    "muted": true
   },
   "background": {
     "enabled": false,

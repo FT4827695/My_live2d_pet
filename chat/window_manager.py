@@ -119,6 +119,63 @@ class WindowManager:
             self.x, self.y = new_x, new_y
             glfw.set_window_pos(self.window, self.x, self.y)
 
+    def get_rect(self):
+        if self.window:
+            try:
+                x, y = glfw.get_window_pos(self.window)
+                w, h = glfw.get_window_size(self.window)
+                return int(x), int(y), int(w), int(h)
+            except Exception:
+                pass
+
+        return int(self.x), int(self.y), int(self.width), int(self.height)
+
+    def set_rect(self, width, height, x=None, y=None):
+        self.width = int(width)
+        self.height = int(height)
+
+        if x is not None and y is not None:
+            self.x = int(x)
+            self.y = int(y)
+
+        if not self.window:
+            return
+
+        # ---------- 优先 Win32 原子更新 ----------
+        try:
+            hwnd = glfw.get_win32_window(self.window)
+            if hwnd and x is not None and y is not None:
+                flags = win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+
+                # 如果存在，则加上，减少窗口位置变化消息
+                flags |= getattr(win32con, "SWP_NOOWNERZORDER", 0)
+                flags |= getattr(win32con, "SWP_NOSENDCHANGING", 0)
+
+                win32gui.SetWindowPos(
+                    hwnd,
+                    0,
+                    self.x,
+                    self.y,
+                    self.width,
+                    self.height,
+                    flags
+                )
+                return
+        except Exception as e:
+            print(f"[WindowManager] Win32 set_rect 失败: {e}")
+
+        # ---------- 兜底：GLFW 分步更新 ----------
+        try:
+            glfw.set_window_size(self.window, self.width, self.height)
+        except Exception as e:
+            print(f"[WindowManager] set_rect 设置尺寸失败: {e}")
+
+        if x is not None and y is not None:
+            try:
+                glfw.set_window_pos(self.window, self.x, self.y)
+            except Exception as e:
+                print(f"[WindowManager] set_rect 设置位置失败: {e}")
+            
     def resize(self, width, height, x=None, y=None):
         self.width = int(width)
         self.height = int(height)

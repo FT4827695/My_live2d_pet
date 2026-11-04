@@ -50,6 +50,10 @@ class RenderPipeline:
         self._render_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._render_future = None
 
+        # 拖曳预览模式
+        self._preview_mode = False
+        self._render_generation = 0
+
     # ==================== 脏标记 ====================
 
     def mark_dirty(self):
@@ -84,9 +88,12 @@ class RenderPipeline:
     # ==================== 调度 ====================
 
     def schedule(self):
-        if not self._pending_tex_update:
+        if self._preview_mode:
             return
 
+        if not self._pending_tex_update:
+            return
+    
         now = time.time()
 
         if self._urgent_update:
@@ -111,9 +118,15 @@ class RenderPipeline:
     # ==================== 后台渲染 ====================
 
     def _render_background(self):
+        gen = self._render_generation
+
         try:
             ctx = self._build_context()
             img, result = self._ui_renderer.render(ctx)
+
+            if gen != self._render_generation or self._preview_mode:
+                return
+
             self._current_cursor_rect = result.cursor_rect
             data = np.array(img, dtype=np.uint8)
             self._pending_image_data = data
@@ -121,7 +134,7 @@ class RenderPipeline:
             glfw.post_empty_event()
         except Exception as e:
             print(f"[渲染后台] 失败: {e}")
-
+        
     # ==================== 纹理上传 ====================
 
     def _upload_pending_texture(self):
@@ -170,6 +183,49 @@ class RenderPipeline:
         self.clear_dirty()
         return rendered
 
+    # ==================== 拖曳预览 ====================
+
+    def begin_external_preview(self):
+        self._preview_mode = True
+        self._render_generation += 1
+
+        self._urgent_update = False
+        self._pending_tex_update = False
+        self._pending_image_data = None
+        self._current_cursor_rect = None
+
+        if self._render_future is not None and not self._render_future.done():
+            self._render_future.cancel()
+
+    def submit_external_frame(self, data, width, height):
+        if not self._preview_mode:
+            return
+
+        self._width = int(width)
+        self._height = int(height)
+
+        self._pending_image_data = data
+        self._current_cursor_rect = None
+
+        self._pending_tex_update = False
+        self._urgent_update = False
+
+        self.mark_dirty()
+        glfw.post_empty_event()
+
+    def end_external_preview(self):
+        self._preview_mode = False
+        self._render_generation += 1
+
+        self._pending_image_data = None
+        self._current_cursor_rect = None
+
+        self._pending_tex_update = True
+        self._urgent_update = True
+        self._last_tex_update_time = 0.0
+
+        glfw.post_empty_event()
+    
     # ==================== 只读属性 ====================
 
     @property
@@ -188,7 +244,7 @@ class RenderPipeline:
 
     def cleanup(self):
         if self._render_executor:
-            self._render_executor.shutdown(wait=False)
+            self._render_executor.shutdown(wait=True)
             self._render_executor = None
 
     def cleanup_gl(self):
