@@ -8,7 +8,7 @@
 import re
 import time
 import threading
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import base64
 import json
 
@@ -28,6 +28,13 @@ _USER_AGENT = (
 _MAX_TOTAL_RESULTS = 12
 _CONNECT_TIMEOUT = 5
 
+_SOURCE_REQUEST_MIN_INTERVAL = 1
+
+_SHORT_LINK_HOSTS = frozenset({
+    "www.baidu.com", "baidu.com", "m.baidu.com",
+    "www.sogou.com", "sogou.com", "m.sogou.com",
+})
+_SHORT_LINK_PATHS = frozenset({"/link", "/link/"})
 
 # ==================== 异常类型 ====================
 
@@ -94,6 +101,72 @@ def _clean_bing_url(url: str) -> str:
         except Exception:
             pass
     return url
+
+# ==================== 跳转链接解码工具 ====================
+
+def _is_short_link(url):
+    if not url:
+        return False
+    host = _host_of(url)
+    if host not in _SHORT_LINK_HOSTS:
+        return False
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return False
+    return path in _SHORT_LINK_PATHS
+
+def _try_local_b64_url(encoded):
+    if not encoded:
+        return ""
+    s = str(encoded).strip()
+    pad = -len(s) % 4
+    for cand in {s, s + "=" * pad}:
+        for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+            try:
+                text = decoder(cand).decode("utf-8", errors="strict")
+            except Exception:
+                continue
+            if text.startswith(("http://", "https://")):
+                return text
+    return ""
+
+_META_REFRESH_PATTERNS = (
+    re.compile(
+        r'http-equiv=["\']?refresh["\']?[^>]*content=["\'][^"\']*url=([^"\'\s>]+)',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'content=["\'][^"\']*url=([^"\'\s>]+)[^>]*http-equiv=["\']?refresh',
+        re.IGNORECASE,
+    ),
+)
+
+_JS_LOCATION_PATTERNS = (
+    re.compile(r'location\.replace\(\s*["\']([^"\']+)["\']'),
+    re.compile(r'location\.href\s*=\s*["\']([^"\']+)["\']'),
+    re.compile(r'window\.location\s*=\s*["\']([^"\']+)["\']'),
+)
+
+
+def _find_meta_refresh_target(html):
+    if not html:
+        return ""
+    for pat in _META_REFRESH_PATTERNS:
+        m = pat.search(html)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _find_js_location_target(html):
+    if not html:
+        return ""
+    for pat in _JS_LOCATION_PATTERNS:
+        m = pat.search(html)
+        if m and m.group(1).startswith(("http://", "https://")):
+            return m.group(1)
+    return ""
 
 # ==================== TTL 缓存 ====================
 
@@ -167,11 +240,37 @@ class BaseSourceAdapter:
     def search(self, query, max_results):
         raise NotImplementedError
 
+    @staticmethod
+    def _is_same_host_protocol_upgrade(orig_url, location):
+        if not location or not location.startswith("https://"):
+            return False
+        if not orig_url.startswith("http://"):
+            return False
+        h1 = _host_of(orig_url)
+        h2 = _host_of(location)
+        return bool(h1 and h1 == h2)
+
+    @staticmethod
+    def _is_safe_same_site_redirect(orig_url, location):
+        if not location or not location.startswith("https://"):
+            return False
+        h1 = _host_of(orig_url)
+        h2 = _host_of(location)
+        if not h1 or not h2:
+            return False
+
+        if orig_url.startswith("http://") and h1 == h2:
+            return True
+
+        def _strip_www(h):
+            return h[4:] if h.startswith("www.") else h
+
+        return _strip_www(h1) == _strip_www(h2)
+    
     def fetch_article(self, info, max_chars):
         raise NotImplementedError
-
+            
 # ==================== 通用 HTTP 声明式适配器 ====================
-
 class GenericHttpSearchAdapter(BaseSourceAdapter):
     source_type = "generic_http"
 
@@ -579,8 +678,15 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
         try:
             resp = session.get(url, timeout=self._timeout(), allow_redirects=False)
             if resp.status_code in (301, 302, 303, 307, 308):
-                print(f"[WebSearch] 目标返回重定向 ({resp.status_code})，未经验证的目标不跟随")
-                return None
+                loc = (resp.headers.get("Location") or "").strip()
+                if self._is_safe_same_site_redirect(url, loc):
+                    resp = session.get(loc, timeout=self._timeout(), allow_redirects=False)
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        print(f"[WebSearch] 二次跳转 ({resp.status_code})，不跟随")
+                        return None
+                else:
+                    print(f"[WebSearch] 目标返回重定向 ({resp.status_code})，未经验证的目标不跟随")
+                    return None
             if resp.status_code != 200:
                 return None
             if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
@@ -597,7 +703,6 @@ class BingSiteSearchAdapter(BaseSourceAdapter):
             return None
         finally:
             session.close()
-
 
 # ==================== Bing 新闻适配器 ====================
 
@@ -943,6 +1048,109 @@ class WebSearchEngine:
             self._ref_counter += 1
             return f"{source_id}_{self._ref_counter}"
 
+    # ---------- sources 请求节流 ----------
+    def _wait_before_source_request(self, adapter, aborted=None):
+        if self._last_source_request_ts <= 0:
+            return
+        elapsed = time.time() - self._last_source_request_ts
+        wait = _SOURCE_REQUEST_MIN_INTERVAL - elapsed
+        if wait <= 0:
+            return
+        name = getattr(adapter, "display_name", "") or getattr(adapter, "source_id", "")
+        print(f"[WebSearch] 节流 {wait:.2f}s（距上次 {elapsed:.2f}s）: {name}")
+        end = time.time() + wait
+        while time.time() < end:
+            if aborted is not None and aborted():
+                return
+            time.sleep(min(0.05, max(0.0, end - time.time())))
+
+    # ---------- 搜索引擎跳转链接解跳 ----------
+    def _unwrap_session(self):
+        settings = InternetSettings.get_instance()
+        s = GuardedSession(policy=Policy())
+        s.headers.update({"User-Agent": _USER_AGENT})
+        proxies = settings.proxies
+        if proxies:
+            s.proxies.update(proxies)
+        return s
+
+    def _unwrap_redirect_url(self, url):
+        if not _is_short_link(url):
+            return url, ""
+
+        host = _host_of(url)
+        try:
+            qs = parse_qs(urlparse(url).query)
+        except Exception:
+            return url, "fail"
+
+        enc = (qs.get("url") or [""])[0]
+        if enc:
+            decoded = _try_local_b64_url(enc)
+            if decoded and self._is_basic_safe_url(decoded):
+                return decoded, "b64"
+
+        referer = "https://www.baidu.com/" if "baidu" in host else "https://www.sogou.com/"
+        session = None
+        try:
+            session = self._unwrap_session()
+            resp = session.get(
+                url,
+                headers={"Referer": referer, "Accept-Language": "zh-CN,zh;q=0.9"},
+                allow_redirects=False,
+                timeout=(_CONNECT_TIMEOUT, InternetSettings.get_instance().request_timeout),
+            )
+        except Exception as e:
+            print(f"[WebSearch] 解跳转失败 {url[:80]}: {e}")
+            return url, "fail"
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = (resp.headers.get("Location") or "").strip()
+            if loc.startswith(("http://", "https://")) and self._is_basic_safe_url(loc):
+                return loc, "302"
+
+        if resp.status_code == 200:
+            try:
+                html = resp.text
+            except Exception:
+                html = ""
+            meta = _find_meta_refresh_target(html)
+            if meta and meta.startswith(("http://", "https://")) and self._is_basic_safe_url(meta):
+                return meta, "meta"
+            js = _find_js_location_target(html)
+            if js and self._is_basic_safe_url(js):
+                return js, "js"
+
+        return url, "fail"
+
+    def _maybe_unwrap_info(self, info):
+        url = str(
+            info.get("url")
+            or (info.get("fetch_info") or {}).get("url")
+            or ""
+        ).strip()
+        if not url or not _is_short_link(url):
+            return info, url
+
+        unwrapped, reason = self._unwrap_redirect_url(url)
+        if reason in ("b64", "302", "meta", "js") and unwrapped != url:
+            print(f"[WebSearch] 解跳转({reason}): {url[:56]}… → {unwrapped[:72]}…")
+            new_info = dict(info)
+            new_info["url"] = unwrapped
+            fetch_info = dict(new_info.get("fetch_info") or {})
+            fetch_info["url"] = unwrapped
+            new_info["fetch_info"] = fetch_info
+            return new_info, unwrapped
+        if reason == "fail":
+            print(f"[WebSearch] 解跳转失败，按原 URL 尝试：{url[:80]}")
+        return info, url
+    
     # ---------- 搜索 ----------
     def search(self, query, max_results=None, aborted=None):
         settings = InternetSettings.get_instance()
@@ -1344,11 +1552,7 @@ class WebSearchEngine:
                     "next_action": "请重新调用 web_search 获取新的结果列表。",
                 }
 
-            fetch_url = str(
-                info.get("url")
-                or (info.get("fetch_info") or {}).get("url")
-                or ""
-            ).strip()
+            info, fetch_url = self._maybe_unwrap_info(info)
 
             if not fetch_url:
                 return {
@@ -1357,7 +1561,7 @@ class WebSearchEngine:
                     "error": "该搜索结果没有可读取的链接。",
                     "next_action": "依据搜索摘要作答，不要重复重试。",
                 }
-
+            
             ok, reason = self._can_fetch_url(
                 fetch_url,
                 adapter.config,

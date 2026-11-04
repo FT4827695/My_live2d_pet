@@ -15,7 +15,7 @@
             "protocol": "tavily",
             "api_base": "https://api.tavily.com",
             "api_key_enc": "",
-            "enabled": true,
+            "enabled": false,
             "request": {},
             "response": {}
         },
