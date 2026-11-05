@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-
 import sys
 import os
 
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+# ============================================================================
+# 路径设置
+# ============================================================================
 base_dir = os.path.dirname(os.path.abspath(__file__))
 plugin_dir = os.path.join(base_dir, "Lib")
 sys.path.insert(0, plugin_dir)
+
+if getattr(sys, 'frozen', False):
+    os.chdir(os.path.dirname(sys.executable))
 
 import time
 import random
@@ -46,6 +55,7 @@ from llm_manager import LlmManager
 from conversation_store import ConversationStore
 from agent_service import AgentService
 import setting_button
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -95,54 +105,82 @@ SOUND_DIALOG_MAP = {
 }
 
 
-# ==================== 音效预加载 ====================
-try:
-    pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
-except pygame.error as e:
-    print(f"[音效] Pygame 初始化失败，音频功能将被禁用: {e}")
-
-SOUNDS = {}
+# ==================== 音效 ====================
 SOUND_NAME_MAP = {
-    "tap_body": "tapBody",
+    "tap_body":   "tapBody",
     "flick_head": "flickHead",
-    "pinch_in": "pinchIn",
-    "pinch_out": "pinchOut",
-    "shake": "shake"
+    "pinch_in":   "pinchIn",
+    "pinch_out":  "pinchOut",
+    "shake":      "shake",
 }
 
-for group, base in SOUND_NAME_MAP.items():
-    pattern = os.path.join(SOUND_DIR, f"{base}_*.mp3")
-    found_files = glob.glob(pattern)
+SOUND_DIALOG_MAP = {
+    "flickHead_0": "有点儿无聊哎",
+    "flickHead_1": "让我算算怎么回事...",
+    "flickHead_2": "给你讲讲这花代表的意思",
+    "pinchIn_0": "嗯...感觉怪怪的",
+    "pinchIn_1": "啊咧？中彩了？",
+    "pinchIn_2": "欸？肩膀...好沉啊",
+    "pinchOut_0": "麦克风Ok，广播Ok，就绪",
+    "pinchOut_1": "啊啊，今天是晴天呢",
+    "pinchOut_2": "测试，麦克风测试，啊啊",
+    "shake_0": "哇啊啊，完了完了完了",
+    "shake_1": "哈哈，真有意思",
+    "shake_2": "哇，吓了一跳",
+    "tapBody_0": "来吧，练习练习",
+    "tapBody_1": "元！气！满满！",
+    "tapBody_2": "打起精神，出发！",
+}
 
-    if not found_files:
-        print(f"[音效] 目录未找到匹配 '{base}' 的音效文件")
-        continue
-
-    for path in found_files:
-        try:
-            filename = os.path.splitext(os.path.basename(path))[0]
-            parts = filename.split("_")
-
-            if len(parts) == 2 and parts[1].isdigit():
-                key = f"{parts[0]}_{int(parts[1])}"
-            else:
-                key = filename
-
-            SOUNDS[key] = pygame.mixer.Sound(path)
-        except Exception as e:
-            print(f"[音效] 加载失败 {path}: {e}")
+SOUNDS = {}
+_audio_ready = False
 
 
+# ==================== 音效初始化 ====================
+def init_audio():
+    global _audio_ready
+    if _audio_ready:
+        return
+
+    try:
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+    except pygame.error as e:
+        print(f"[音效] Pygame 初始化失败，音频功能将被禁用: {e}")
+        return
+
+    for group, base in SOUND_NAME_MAP.items():
+        pattern = os.path.join(SOUND_DIR, f"{base}_*.mp3")
+        found_files = glob.glob(pattern)
+        if not found_files:
+            print(f"[音效] 目录未找到匹配 '{base}' 的音效文件")
+            continue
+        for path in found_files:
+            try:
+                filename = os.path.splitext(os.path.basename(path))[0]
+                parts = filename.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    key = f"{parts[0]}_{int(parts[1])}"
+                else:
+                    key = filename
+                SOUNDS[key] = pygame.mixer.Sound(path)
+            except Exception as e:
+                print(f"[音效] 加载失败 {path}: {e}")
+
+    _audio_ready = True
+    print(f"[音效] 已加载 {len(SOUNDS)} 个音效")
+
+
+# ==================== 播放 & 对话 ====================
 def play_sound(group_name, index):
+    if not _audio_ready:
+        return
     if setting_button.is_audio_muted():
         return
     if not SOUNDS:
         return
-
     base = SOUND_NAME_MAP.get(group_name, group_name)
     key = f"{base}_{index}"
     snd = SOUNDS.get(key)
-
     if snd:
         snd.play()
     else:
@@ -153,7 +191,6 @@ def get_dialog_for_sound(sound_group: str, index: int) -> str:
     prefix = SOUND_NAME_MAP.get(sound_group, sound_group)
     key = f"{prefix}_{index}"
     return SOUND_DIALOG_MAP.get(key)
-
 
 @dataclass
 class PendingMotion:
@@ -978,7 +1015,8 @@ class Live2DPet:
 
         finally:
             self._cleanup_runtime()
-        
+
 if __name__ == "__main__":
+    init_audio() 
     pet = Live2DPet()
     pet.run()

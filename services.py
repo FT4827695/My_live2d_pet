@@ -291,23 +291,75 @@ class CodeExecutor:
         return success, output
 
     @staticmethod
-    def execute_code_with_raw(
-        code_str: str,
-        df: pd.DataFrame = None,
-        dfs: list = None
-    ):
+    def _execute_in_sandbox_namespace(code_str, df, dfs):
+        import math as _math
+        import re as _re
+        import json as _json
+        import datetime as _datetime
+        import collections as _collections
+        import itertools as _itertools
+        import statistics as _statistics
+
+        # 构造受限命名空间（只暴露白名单内容）
+        namespace = {
+            "__builtins__": {
+                # 只允许安全的内置函数
+                "print": print, "len": len, "range": range, "enumerate": enumerate,
+                "zip": zip, "map": map, "filter": filter, "sorted": sorted,
+                "min": min, "max": max, "sum": sum, "abs": abs, "round": round,
+                "int": int, "float": float, "str": str, "bool": bool, "list": list,
+                "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
+                "isinstance": isinstance, "type": type, "hasattr": hasattr,
+                "getattr": getattr, "setattr": setattr, "repr": repr,
+                "True": True, "False": False, "None": None,
+                "ValueError": ValueError, "TypeError": TypeError,
+                "KeyError": KeyError, "IndexError": IndexError,
+                "Exception": Exception,
+            },
+            # 白名单库
+            "pd": pd,
+            "np": np,
+            "math": _math,
+            "re": _re,
+            "json": _json,
+            "datetime": _datetime,
+            "collections": _collections,
+            "itertools": _itertools,
+            "statistics": _statistics,
+            # 数据
+            "df": df,
+            "dfs": dfs,
+        }
+
+        # 捕获 stdout
+        import io, contextlib
+        stdout_capture = io.StringIO()
+        result = None
+
+        try:
+            with contextlib.redirect_stdout(stdout_capture):
+                exec(code_str, namespace)
+            result = namespace.get("result", None)
+        except Exception as e:
+            output = stdout_capture.getvalue()
+            return False, f"代码执行出错: {e}\n{output}", None
+
+        output = stdout_capture.getvalue()
+        return True, output, result
+
+    @staticmethod
+    def execute_code_with_raw(code_str, df=None, dfs=None):
         # ===== 1. 数据预处理 =====
         if df is not None:
             df = df.copy(deep=True)
             df.columns = [str(c) for c in df.columns]
-
         if dfs is not None:
             dfs = [d.copy(deep=True) if d is not None else None for d in dfs]
             for d in dfs:
                 if d is not None:
                     d.columns = [str(c) for c in d.columns]
 
-        # ===== 2. 剥离白名单内的 import 语句（前置清理） =====
+        # ===== 2. 剥离白名单内的 import 语句 =====
         allowed_imports = r'(pandas|numpy|math|re|json|datetime|collections|itertools|statistics)'
         code_str = re.sub(rf'^\s*import\s+{allowed_imports}\b.*$', '', code_str, flags=re.MULTILINE)
         code_str = re.sub(rf'^\s*from\s+{allowed_imports}\s+import\b.*$', '', code_str, flags=re.MULTILINE)
@@ -321,23 +373,23 @@ class CodeExecutor:
             tree = ast.parse(code_str)
         except SyntaxError as e:
             return False, f"代码语法错误: {e}", None
-
         visitor = _PandasIOVisitor()
         visitor.visit(tree)
         if visitor.violations:
             return False, "代码包含被禁止的 I/O 操作：\n" + "\n".join(visitor.violations), None
 
-        # ===== 5. 序列化数据并调用子进程 =====
+        # ===== 5. 根据环境选择执行方式 =====
+        if getattr(sys, 'frozen', False):
+            return CodeExecutor._execute_in_sandbox_namespace(code_str, df, dfs)
+
         payload = {
             "code": code_str,
             "df": CodeExecutor._df_to_json_payload(df),
             "dfs": [CodeExecutor._df_to_json_payload(d) for d in dfs] if dfs else None,
         }
-        
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
-
         try:
             proc = subprocess.Popen(
                 [sys.executable, _SANDBOX_RUNNER],
@@ -345,29 +397,21 @@ class CodeExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                encoding="utf-8",
-                env=env, 
+                encoding="utf-8", errors="ignore",
+                env=env,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
             try:
-                payload_text = json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    allow_nan=False
-                )
+                payload_text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             except Exception as e:
                 return False, f"表格数据无法安全序列化为 JSON：{e}", None
-
-            stdout, stderr = proc.communicate(
-                payload_text,
-                timeout=600,
-            )
+            stdout, stderr = proc.communicate(payload_text, timeout=600)
         except subprocess.TimeoutExpired:
             if os.name == "nt":
                 subprocess.call(
                     ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    encoding="utf-8", errors="ignore",
                 )
             else:
                 proc.kill()
@@ -377,24 +421,18 @@ class CodeExecutor:
             return False, f"子进程启动失败: {e}", None
 
         if not stdout.strip():
-            return False, f"子进程无输出。stderr: {stderr[:2000]}", None
-        if not stdout.strip():
-            return False, f"子进程无有效输出。stderr: {(stderr or '')[:2000]}", None
-
+            return False, f"子进程无输出。stderr: {(stderr or '')[:2000]}", None
         try:
             res = json.loads(stdout)
         except json.JSONDecodeError:
             return False, f"子进程返回非 JSON 内容: {stdout[:2000]}", None
-
         if not res.get("success"):
             return False, res.get("output", "子进程执行失败"), None
 
         result = res.get("result")
         output = res.get("output", "")
-
         if output:
             return True, output, result
-
         if result is not None:
             if isinstance(result, pd.DataFrame):
                 display = result.to_csv(index=False)
@@ -403,7 +441,6 @@ class CodeExecutor:
             else:
                 display = str(result)
             return True, display, result
-
         return False, "代码执行成功但没有输出。务必在代码末尾使用 `result = ...` 或 `print(...)` 来输出结果。", None
 
 
