@@ -59,6 +59,7 @@ def get_available_vram_mb():
                'get', 'Name,AdapterRAM', '/format:csv']
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
         raw = subprocess.check_output(
             cmd, stderr=subprocess.DEVNULL, startupinfo=si)
 
@@ -246,7 +247,7 @@ class _RealXllamaEngine:
             os.makedirs(media_dir, exist_ok=True)
 
         params = xlc.CommonParams()
-        params.verbosity = 1
+        params.verbosity = 0
         params.model.path = self.model_path
 
         if hasattr(params, "use_jinja"):

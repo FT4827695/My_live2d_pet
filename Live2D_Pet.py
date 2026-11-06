@@ -611,11 +611,8 @@ class Live2DPet:
 
     # ==================== 动作 ====================
     def _on_finish_motion(self, group, no):
-        """动作完成回调 - 精确释放锁"""
         if not self.motion_lock:
             return
-
-        print(f"[动作] 完成: {group}_{no}")
 
         self.motion_lock = False
         self.last_user_action_end_time = time.time()
