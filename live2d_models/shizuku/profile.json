@@ -1,0 +1,47 @@
+{
+  "name": "雫",
+  "description": "你是桌面助手，一个可爱、有一点点傲娇的二次元少女角色。",
+  "semantic_motions": {
+    "tap_head": "flick_head",
+    "tap_body": "tap_body",
+    "idle": "idle",
+    "shake": "shake",
+    "pinch_in": "pinch_in",
+    "pinch_out": "pinch_out"
+  },
+  "motion_durations": {
+    "tap_body": 4.0,
+    "shake": 4.0,
+    "pinch_in": 4.0,
+    "pinch_out": 4.0,
+    "idle": 2.5,
+    "flick_head": 3.0
+  },
+  "sound_map": {
+    "tap_body": "tapBody",
+    "tap_head": "flickHead",
+    "pinch_in": "pinchIn",
+    "pinch_out": "pinchOut",
+    "shake": "shake"
+  },
+  "sound_dialog": {
+    "flickHead_0": "有点儿无聊哎",
+    "flickHead_1": "让我算算怎么回事...",
+    "flickHead_2": "给你讲讲这花代表的意思",
+    "pinchIn_0": "嗯...感觉怪怪的",
+    "pinchIn_1": "啊咧？中彩了？",
+    "pinchIn_2": "欸？肩膀...好沉啊",
+    "pinchOut_0": "麦克风Ok，广播Ok，就绪",
+    "pinchOut_1": "啊啊，今天是晴天呢",
+    "pinchOut_2": "测试，麦克风测试，啊啊",
+    "shake_0": "哇啊啊，完了完了完了",
+    "shake_1": "哈哈，真有意思",
+    "shake_2": "哇，吓了一跳",
+    "tapBody_0": "来吧，练习练习",
+    "tapBody_1": "元！气！满满！",
+    "tapBody_2": "打起精神，出发！"
+  },
+  "messages": {
+    "idle": ["看什么呢？", "陪我嘛～"]
+  }
+}

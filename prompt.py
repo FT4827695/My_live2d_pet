@@ -11,6 +11,22 @@ from settings_store import BASE_DIR
 
 _CHARACTER_FILE = os.path.join(BASE_DIR, "config", "character.json")
 
+# === 模型人设覆盖层（内存态） ===
+_model_character = None
+
+def set_model_character(name, description):
+    global _model_character
+    _model_character = {"name": name, "description": description}
+
+def clear_model_character():
+    global _model_character
+    _model_character = None
+
+def _get_effective_character():
+    if _model_character:
+        return _model_character
+    return _load_character_data()
+
 @lru_cache(maxsize=1)
 def _load_character_data():
     default = {
@@ -40,7 +56,7 @@ def _load_character_data():
         return default
 
 def get_character_name() -> str:
-    return _load_character_data()["name"]
+    return _get_effective_character()["name"] 
 
 def clear_character_cache():
     _load_character_data.cache_clear()
@@ -183,9 +199,8 @@ _THINKING_RULES = _THINKING_RULES_TOOL
 # ================== 内部工具 ==================
 
 def _build_character_prefix() -> str:
-    data = _load_character_data()
+    data = _get_effective_character()
     return f"{data['description']} 你叫{data['name']}。"
-
 
 # ================== 对外核心接口 ==================
 

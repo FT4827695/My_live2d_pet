@@ -7,6 +7,7 @@
 import os
 import math
 import time
+import random
 
 import numpy as np
 from OpenGL import GL as gl
@@ -170,10 +171,29 @@ def _draw_resize_unlock(d, cx, cy, s, color, active):
             width=inner_lw
         )
 
+def _draw_model_switch(d, cx, cy, s, color, active):
+    lw = max(2, int(s * 0.055))
+    # 头部（圆）
+    head_r = s * 0.10
+    d.ellipse([cx - head_r, cy - s * 0.34, cx + head_r, cy - s * 0.34 + head_r * 2],
+              outline=color, width=lw)
+    # 身体（竖线）
+    d.line([(cx, cy - s * 0.14), (cx, cy + s * 0.12)], fill=color, width=lw)
+    # 手臂
+    d.line([(cx - s * 0.16, cy - s * 0.04), (cx + s * 0.16, cy - s * 0.04)],
+           fill=color, width=lw)
+    # 腿
+    d.line([(cx, cy + s * 0.12), (cx - s * 0.12, cy + s * 0.32)], fill=color, width=lw)
+    d.line([(cx, cy + s * 0.12), (cx + s * 0.12, cy + s * 0.32)], fill=color, width=lw)
+    # 右侧弧形箭头（表示切换）
+    d.arc([cx + s * 0.10, cy - s * 0.30, cx + s * 0.38, cy - s * 0.02],
+          start=-60, end=160, fill=color, width=lw)
+
 _ICON_DRAWERS = {
     "audio": _draw_speaker,
     "background": _draw_picture,
     "chat_resize": _draw_resize_unlock,
+    "model_switch": _draw_model_switch,
 }
 
 def _make_button_image(diameter, kind, active):
@@ -328,6 +348,9 @@ class SettingButtonGroup:
             _ButtonItem("chat_resize", "chat_resize",
                         lambda: is_chat_resize_unlocked(),
                         self._on_chat_resize_click),
+            _ButtonItem("model_switch", "model_switch",
+                        lambda: False,
+                        self._on_model_switch_click),
         ]
 
     # ---------- 点击行为 ----------
@@ -351,6 +374,33 @@ class SettingButtonGroup:
         if new_state:
             self._show_resize_shift_tip()
 
+    def _on_model_switch_click(self):
+        pet = getattr(self, "pet", None)
+        if pet is None:
+            return
+
+        # LLM 已加载/加载中时禁止切换
+        if getattr(pet, "model_ready", False) or getattr(pet, "model_loading", False):
+            self._queue_pet_bubble("先把脑子卸了再换嘛~")
+            return
+
+        # 检查可用模型数量
+        registry = getattr(pet, "registry", None)
+        if registry is None or len(registry) <= 1:
+            self._queue_pet_bubble("哎？没别的啦~")
+            return
+
+        # 随机选一个非当前模型
+        current_id = pet.current_context.model_id if pet.current_context else None
+        candidates = [mid for mid in registry.list_model_ids() if mid != current_id]
+        if not candidates:
+            self._queue_pet_bubble("没有别的了~")
+            return
+
+        target = random.choice(candidates)
+        self._queue_pet_bubble("切换中~")
+        pet.switch_model(target)
+        
     def _show_resize_shift_tip(self):
         now = time.time()
 

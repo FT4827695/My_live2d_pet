@@ -6,7 +6,7 @@ import threading
 import glfw
 from typing import Any, Dict, List, Optional, Tuple, Callable
 from services import ClipboardService
-
+from prompt import get_character_name
 
 # ============================================================
 # 可循环切换的参数选项
@@ -538,7 +538,7 @@ class MenuManager:
                 except Exception:
                     pass
             else:
-                self.add_message("shizuku", message)
+                self.add_message(get_character_name(), message)
 
         timer = threading.Timer(0.8, _do_announce)
         self._announce_timers[key] = timer
@@ -663,7 +663,7 @@ class MenuManager:
     def _open_character_file(self) -> None:
         path = _get_character_file_path()
         if not os.path.exists(path):
-            self.add_message("shizuku", "未找到人设文件 character.json")
+            self.add_message(get_character_name(), "未找到人设文件 character.json")
             return
         try:
             if sys.platform.startswith("win"):
@@ -675,7 +675,7 @@ class MenuManager:
                 import subprocess
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
-            self.add_message("shizuku", f"打开文件失败: {e}")
+            self.add_message(get_character_name(), f"打开文件失败: {e}")
 
     # ==================== 联网搜索：开关与配置 ====================
 
@@ -683,7 +683,7 @@ class MenuManager:
         try:
             from internet_settings import InternetSettings
         except Exception as e:
-            self.add_message("shizuku", f"联网设置模块不可用: {e}")
+            self.add_message(get_character_name(), f"联网设置模块不可用: {e}")
             return
         settings = InternetSettings.get_instance()
         # 重载磁盘配置，避免覆盖手动修改
@@ -695,23 +695,23 @@ class MenuManager:
             names = settings.enabled_source_names()
             if not names or names == "无":
                 self.add_message(
-                    "shizuku",
+                    get_character_name(),
                     "联网搜索已开启，但白名单里没有启用的来源，"
                     "请先点「网站和代理」配置。"
                 )
             else:
                 self.add_message(
-                    "shizuku",
+                    get_character_name(),
                     f"联网搜索已开启，下一轮对话即可使用。可用来源：{names}"
                 )
         else:
-            self.add_message("shizuku", "联网搜索已关闭。")
+            self.add_message(get_character_name(), "联网搜索已关闭。")
 
     def _open_internet_settings_file(self) -> None:
         try:
             from internet_settings import InternetSettings
         except Exception as e:
-            self.add_message("shizuku", f"联网设置模块不可用: {e}")
+            self.add_message(get_character_name(), f"联网设置模块不可用: {e}")
             return
         path = InternetSettings.get_settings_path()
         if os.path.exists(path):
@@ -720,18 +720,18 @@ class MenuManager:
                     json.load(f)
             except json.JSONDecodeError as e:
                 self.add_message(
-                    "shizuku",
+                    get_character_name(),
                     f"警告：Internet_setting.json 语法有误（第{e.lineno}行：{e.msg}），"
                     f"已按上次有效配置运行。请修正后保存。"
                 )
             except Exception as e:
-                self.add_message("shizuku", f"警告：配置文件读取异常：{e}")
+                self.add_message(get_character_name(), f"警告：配置文件读取异常：{e}")
         try:
             InternetSettings.get_instance().reload()
         except Exception:
             pass
         if not os.path.exists(path):
-            self.add_message("shizuku", "未找到联网配置文件。")
+            self.add_message(get_character_name(), "未找到联网配置文件。")
             return
         try:
             if sys.platform.startswith("win"):
@@ -743,9 +743,9 @@ class MenuManager:
                 import subprocess
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
-            self.add_message("shizuku", f"打开文件失败: {e}")
+            self.add_message(get_character_name(), f"打开文件失败: {e}")
             return
-        self.add_message("shizuku", "已打开联网配置，修改保存后下一轮对话生效。")
+        self.add_message(get_character_name(), "已打开联网配置，修改保存后下一轮对话生效。")
         
     # ==================== 设置菜单A：命令处理 ====================
     def handle_settings_command(self, cmd: str) -> None:
@@ -840,7 +840,7 @@ class MenuManager:
             except Exception:
                 pass
 
-            self.add_message("shizuku", message)
+            self.add_message(get_character_name(), message)
             self.pet.load_llm_manually(use_gpu=use_gpu, use_mmproj=use_mmproj)
             self.hide_settings_menu(force=True)
             return
@@ -849,7 +849,7 @@ class MenuManager:
         if cmd == "unload":
             self.pet.unload_llm()            
             self.pet.queue_bubble("脑子没啦，真是好轻松~")
-            self.add_message("shizuku", "模型已卸载")
+            self.add_message(get_character_name(), "模型已卸载")
         # 清空对话
         elif cmd == "clear_chat":
             self.vm.clear_messages()
@@ -860,7 +860,7 @@ class MenuManager:
             if getattr(self.vm, "is_generating", False) and hasattr(self.vm, "stop_generation"):
                 stopped = self.vm.stop_generation()
                 if not stopped:
-                    self.add_message("shizuku", "（已放弃思考）")
+                    self.add_message(get_character_name(), "（已放弃思考）")
         self.hide_settings_menu(force=True)
 
     # ==================== 菜单B：语音设置 ====================
@@ -964,7 +964,7 @@ class MenuManager:
         self.model_settings.save()
         self.refresh_settings_menu_b(clear_rects=False)
         self.add_message(
-            "shizuku",
+            get_character_name(),
             f"语音输入已{display_value}。",
         )
 
@@ -983,7 +983,7 @@ class MenuManager:
         self.model_settings.save()
         self.refresh_settings_menu_b(clear_rects=False)
         self.add_message(
-            "shizuku",
+            get_character_name(),
             f"录音快捷键已切换为 {display_value}。",
         )
 

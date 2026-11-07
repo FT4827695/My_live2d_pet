@@ -4,7 +4,7 @@ chat_controller.py
 """
 import queue
 from services import ClipboardService, TextUtils
-
+from prompt import get_character_name
 
 class ChatController:
     def __init__(self, vm, input_box, doc_uploader, scroll_manager, selected_messages,
@@ -42,7 +42,7 @@ class ChatController:
         chat_window = getattr(pet, "chat_window", None)
         if chat_window is not None and getattr(chat_window, "active", False):
             try:
-                chat_window.add_message("shizuku", text)
+                chat_window.add_message(get_character_name(), text)
                 delivered = True
             except Exception as e:
                 print(f"[ChatController] notify_user 写聊天窗口失败: {e}")
@@ -145,7 +145,7 @@ class ChatController:
                         self.request_update(urgent=True)
                         self.mark_dirty()
                     elif item[0] == 'announce':
-                        self.add_message("shizuku", item[1])
+                        self.add_message(get_character_name(), item[1])
                     elif isinstance(item[0], int):
                         thinking_idx, reply = item
                         if reply not in ("（放弃思考）", "（已停止生成）"):
@@ -153,7 +153,7 @@ class ChatController:
                         if thinking_idx < len(self.vm.messages):
                             sender, current_text = self.vm.messages[thinking_idx]
                             if (
-                                sender == "shizuku"
+                                sender != "user" 
                                 and current_text != "（思考中...）"
                                 and reply not in ("（放弃思考）", "（已停止生成）")
                             ):
@@ -231,7 +231,7 @@ class ChatController:
             elif sender == "stats":
                 prefix = ""
             else:
-                prefix = "雫: "
+                prefix = f"{sender}: "
             lines.append(prefix + text)
         if lines:
             ClipboardService.set_text("\n".join(lines))

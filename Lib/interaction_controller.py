@@ -19,31 +19,6 @@ import glfw
 import pyautogui
 from pynput.mouse import Listener as MouseListener
 
-
-HEAD_KEYWORDS = [
-    "HAIR",
-    "FACE",
-    "EYE",
-    "BROW",
-    "MOUTH",
-    "NOSE",
-    "EAR",
-    "HEAD"
-]
-
-BODY_KEYWORDS = [
-    "UNIFORM",
-    "BODY",
-    "PAJAMA",
-    "ARM",
-    "NECK",
-    "IRAIRA",
-    "ASE",
-    "KIRAKIRA",
-    "SKETCH"
-]
-
-
 class InteractionController:
     def __init__(self, pet):
         self.pet = pet
@@ -114,9 +89,16 @@ class InteractionController:
             sx, sy = pyautogui.position()
             wx, wy = glfw.get_window_pos(window)
             rel_x, rel_y = sx - wx, sy - wy
+        
             if pet.setting_button.on_click(rel_x, rel_y):
                 return
-            part_id, is_head = pet.is_hit_part(rel_x, rel_y, HEAD_KEYWORDS)
+            
+            # === 动态获取点击关键词 ===
+            ctx = getattr(pet, 'current_context', None)
+            head_kw = ctx.head_keywords if ctx else []
+            body_kw = ctx.body_keywords if ctx else []
+        
+            part_id, is_head = pet.is_hit_part(rel_x, rel_y, head_kw)
             if is_head:
                 now = time.time()
                 if now - self.last_click_time < self.click_cooldown:
@@ -124,14 +106,15 @@ class InteractionController:
                 self.last_click_time = now
                 pet.play_head_click_motion()
                 return
-            _, is_body = pet.is_hit_part(rel_x, rel_y, BODY_KEYWORDS)
+            
+            _, is_body = pet.is_hit_part(rel_x, rel_y, body_kw)
             if is_body:
                 now = time.time()
                 if now - self.last_click_time < self.click_cooldown:
                     return
                 self.last_click_time = now
                 pet.play_body_click_motion()
-                return
+                return            
             if pet.chat_window and pet.chat_window.active:
                 return
             # 未命中任何交互部件 → 拖拽窗口

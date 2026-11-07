@@ -264,7 +264,8 @@ class CharacterEditor:
 
             if self.add_message is not None:
                 try:
-                    self.add_message("shizuku", "人设已保存，重新加载模型后生效。")
+                    from prompt import get_character_name
+                    self.add_message(get_character_name(), "人设已保存，重新加载模型后生效。")
                 except Exception:
                     pass
 

@@ -169,8 +169,10 @@ class TextUtils:
         elif sender == "stats":
             prefix = ""
         else:
-            prefix = ASSISTANT_PREFIX
-
+            if sender and sender != "shizuku":
+                prefix = f"{sender}: "
+            else:
+                prefix = f"{get_character_name()}: "
         text = TextUtils.clean_text(text).replace('\r\n', '\n').replace('\r', '\n')
         full = prefix + text
         lines = []

@@ -364,7 +364,7 @@ class IndependentChatWindow:
 
         # 6. 首次打开的初始消息
         if self._first_show:
-            self.add_message("shizuku", "干嘛~")
+            self.add_message(get_character_name(), "干嘛~")
             self._first_show = False
             self._sync_layout()
 
@@ -1483,6 +1483,7 @@ class IndependentChatWindow:
     def show(self):
         self._minimized_close_pending = False
         self._ensure_window_and_gl()  # 按需重建 Context
+        self._refresh_character_ui()
 
         # 业务重置
         self.voice_ctrl.set_active(True)

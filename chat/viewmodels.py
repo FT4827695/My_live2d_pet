@@ -1,7 +1,7 @@
 import threading
 import queue
 from services import MessageProcessor
-
+from prompt import get_character_name
 
 class ChatViewModel:
 
@@ -43,14 +43,14 @@ class ChatViewModel:
         stopped_text = "（放弃思考）"
         idx = getattr(self, '_generating_idx', None)
         if idx is not None and 0 <= idx < len(self.messages):
-            self.messages[idx] = ("shizuku", stopped_text)
+            self.messages[idx] = (self.messages[idx][0], stopped_text)
             self.update_queue.put((idx, stopped_text))
             if self.wake_up_func:
                 self.wake_up_func()
             return True
         for i in range(len(self.messages) - 1, -1, -1):
             sender, text = self.messages[i]
-            if sender == "shizuku" and text == "（思考中...）":
+            if sender != "user" and text == "（思考中...）":
                 self.messages[i] = (sender, stopped_text)
                 self.update_queue.put((i, stopped_text))
                 if self.wake_up_func:
@@ -85,12 +85,12 @@ class ChatViewModel:
             engine.abort_generation()
             for i in range(len(self.messages) - 1, -1, -1):
                 sender, text = self.messages[i]
-                if sender == "shizuku" and text == "（思考中...）":
+                if sender != "user" and text == "（思考中...）": 
                     self.messages[i] = (sender, "（放弃思考）")
                     self.update_queue.put((i, "（放弃思考）"))
                     break
 
-        self.add_message("shizuku", "（思考中...）")
+        self.add_message(get_character_name(), "（思考中...）")
         thinking_idx = len(self.messages) - 1
         self._generating_idx = thinking_idx
 
