@@ -1,7 +1,7 @@
 {
   "version": 1,
   "audio": {
-    "muted": true
+    "muted": false
   },
   "background": {
     "enabled": false,
@@ -17,6 +17,6 @@
     "custom_display_scale": 1.0
   },
   "model": {
-    "current": "koharu"
+    "current": "shizuku"
   }
 }

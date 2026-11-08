@@ -51,13 +51,17 @@ def _clear_character_cache() -> None:
     try:
         if prompt is None:
             return
+        if hasattr(prompt, "clear_model_character"):
+            try:
+                prompt.clear_model_character()
+            except Exception:
+                pass
         if hasattr(prompt, "clear_character_cache"):
             prompt.clear_character_cache()
         elif hasattr(prompt, "_load_character_data"):
             prompt._load_character_data.cache_clear()
     except Exception:
         pass
-
 
 class CharacterEditor:
 

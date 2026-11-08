@@ -22,10 +22,21 @@ def clear_model_character():
     global _model_character
     _model_character = None
 
+def _character_file_exists() -> bool:
+    try:
+        return os.path.exists(_CHARACTER_FILE)
+    except Exception:
+        return False
+
 def _get_effective_character():
+    if _character_file_exists():
+        return _load_character_data()
     if _model_character:
         return _model_character
-    return _load_character_data()
+    return {
+        "name": "雫",
+        "description": "你是桌面助手，一个可爱的二次元少女角色。",
+    }
 
 @lru_cache(maxsize=1)
 def _load_character_data():

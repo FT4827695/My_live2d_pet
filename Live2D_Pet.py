@@ -395,22 +395,31 @@ class Live2DPet:
                             _load_character_data, get_character_name)
         from model_registry import resolve_character
 
-        global_data = _load_character_data()
-        eff_name, eff_desc = resolve_character(
-            ctx,
-            global_name=global_data.get("name"),
-            global_desc=global_data.get("description")
-        )
+        character_exists = False
+        try:
+            character_exists = os.path.exists(get_character_file_path())
+        except Exception:
+            character_exists = False
 
-        set_model_character(eff_name, eff_desc)
-        clear_character_cache()
+        if character_exists:
+            clear_model_character()
+            clear_character_cache()
+        else:
+            global_data = _load_character_data()
+            eff_name, eff_desc = resolve_character(
+                ctx,
+                global_name=global_data.get("name"),
+                global_desc=global_data.get("description"),
+            )
+            set_model_character(eff_name, eff_desc)
+            clear_character_cache()
 
         if self.chat_window is not None:
             try:
                 self.chat_window._refresh_character_ui()
             except Exception as e:
                 print(f"[模型切换] 刷新角色名失败: {e}")
-                
+
     def _on_llm_loaded(self, engine, use_gpu: bool, use_mmproj: bool):
         mode_desc = "显卡" if use_gpu else "内存"
         mm_desc = "多模态" if use_mmproj else "纯文本"
