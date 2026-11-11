@@ -342,10 +342,6 @@ class Live2DPet:
         # ---- 记忆模型 ----
         self.remember_current_model()
 
-        # ---- 气泡通知 ----
-        from prompt import get_character_name
-        self.queue_bubble(f"{get_character_name()}，来啦！")
-
         print(f"[模型切换] <<< 完成")
         return True
 
@@ -716,7 +712,14 @@ class Live2DPet:
             if final_msg and self.window:
                 chat_open = self.chat_window is not None and self.chat_window.active
                 if not (chat_open and semantic_group == "idle"):
-                    self.show_bubble(final_msg)
+                    suppress_idle = False
+                    if semantic_group == "idle":
+                        try:
+                            suppress_idle = self.setting_button.is_tip_active()
+                        except Exception:
+                            suppress_idle = False
+                    if not suppress_idle:
+                        self.show_bubble(final_msg)
             return True
         except Exception as e:
             print(f"[动作] 异常 ({actual_group}/{index}): {e}")
@@ -1047,11 +1050,28 @@ class Live2DPet:
                 frame_time = 1.0 / desired_fps
                 elapsed = time.perf_counter() - frame_start
 
-                if elapsed < frame_time:
-                    glfw.wait_events_timeout(frame_time - elapsed)
-                    remaining = frame_time - (time.perf_counter() - frame_start)
-                    if remaining > 0.002:
-                        time.sleep(remaining)
+                active = (
+                    self.motion_lock or
+                    self.interaction.is_dragging or
+                    (self.chat_window is not None and self.chat_window.active) or
+                    time.time() - self.last_interaction_time < self.idle_delay
+                )
+
+                desired_fps = self.active_fps if active else self.idle_fps
+                frame_time = 1.0 / desired_fps
+
+                deadline = frame_start + frame_time
+                while True:
+                    now = time.perf_counter()
+                    if now >= deadline:
+                        break
+                    remain = deadline - now
+                    if remain > 0.001:
+                        time.sleep(remain - 0.0005)
+                    else:
+                        time.sleep(0)
+                    if deadline - time.perf_counter() > 0.002:
+                        glfw.poll_events()
 
                 frame_start = time.perf_counter()
 

@@ -330,6 +330,7 @@ class SettingButtonGroup:
         self._vbo = 0
         self._gl_ready = False
         self._next_rebuild_try = 0.0
+        self._loc = {}
 
         self._group_alpha = 0.0
         self._last_tick = 0.0
@@ -337,6 +338,12 @@ class SettingButtonGroup:
 
         # 聊天窗口大小解锁提示冷却
         self._last_resize_tip_time = 0.0
+
+        # 提示静默期
+        self._tip_suppress_until = 0.0
+
+        # 延迟回调队列：[剩余秒数, callback]
+        self._pending = []
 
         self._buttons = [
             _ButtonItem("audio", "audio",
@@ -372,8 +379,13 @@ class SettingButtonGroup:
         set_chat_resize_unlocked(new_state)
 
         if new_state:
-            self._show_resize_shift_tip()
-
+            self._queue_pet_bubble("聊天窗口可以调整啦")
+            self._tip_suppress_until = time.time() + 2.0
+            self._schedule(2.0, self._show_resize_shift_tip)
+            
+    def is_tip_active(self):
+        return time.time() < self._tip_suppress_until
+    
     def _on_model_switch_click(self):
         pet = getattr(self, "pet", None)
         if pet is None:
@@ -398,7 +410,6 @@ class SettingButtonGroup:
             return
 
         target = random.choice(candidates)
-        self._queue_pet_bubble("切换中~")
         pet.switch_model(target)
         
     def _show_resize_shift_tip(self):
@@ -409,7 +420,34 @@ class SettingButtonGroup:
 
         self._last_resize_tip_time = now
         self._queue_pet_bubble("按Shift可以等比例调整哦")
+        self._tip_suppress_until = max(self._tip_suppress_until, now + 5.0)
+        
+    def _schedule(self, delay, callback):
+        try:
+            delay = max(0.0, float(delay))
+        except Exception:
+            delay = 0.0
+        self._pending.append([delay, callback])
 
+    def _process_pending(self, dt):
+        if not self._pending:
+            return
+
+        ready = []
+        remain = []
+        for item in self._pending:
+            item[0] -= dt
+            if item[0] <= 0.0:
+                ready.append(item[1])
+            else:
+                remain.append(item)
+        self._pending = remain
+
+        for cb in ready:
+            try:
+                cb()
+            except Exception as e:
+                print(f"[SettingButton] 延迟任务失败: {e}")
 
     def _queue_pet_bubble(self, text):
         pet = getattr(self, "pet", None)
@@ -488,7 +526,6 @@ class SettingButtonGroup:
             if win is None:
                 return None
             sx, sy = glfw.get_cursor_pos(win)
-            wx, wy = glfw.get_window_pos(win)
             return (sx, sy)
         except Exception:
             return None
@@ -499,6 +536,8 @@ class SettingButtonGroup:
             return True
         try:
             self._program = _compile(_VS, _FS)
+            self._loc = {n: gl.glGetUniformLocation(self._program, n)
+                         for n in ("uScreen", "uTex", "uAlpha")}
             self._vao = int(gl.glGenVertexArrays(1))
             self._vbo = int(gl.glGenBuffers(1))
             gl.glBindVertexArray(self._vao)
@@ -550,10 +589,17 @@ class SettingButtonGroup:
         
     # ---------- 每帧 ----------
     def tick_and_draw(self, now, win_w, win_h, cursor_rel=None):
+        if self._last_tick <= 0.0:
+            raw_dt = 0.0
+        else:
+            raw_dt = max(0.0, now - self._last_tick)
+        self._last_tick = now
+
+        self._process_pending(raw_dt)
+
         if self._hidden_by_chat():
             self.hovered = False
             self._group_alpha = 0.0
-            self._last_tick = now
             return
 
         self.set_scale(getattr(self.pet, "ui_scale", self.ui_scale))
@@ -572,11 +618,7 @@ class SettingButtonGroup:
             if not self._gl_ready:
                 return
 
-        if self._last_tick <= 0.0:
-            dt = 0.0
-        else:
-            dt = max(0.0, min(0.1, now - self._last_tick))
-        self._last_tick = now
+        dt = max(0.0, min(0.1, raw_dt))
 
         if cursor_rel is None:
             cursor_rel = self._cursor_rel()
@@ -620,9 +662,8 @@ class SettingButtonGroup:
         gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)  # 预乘
         gl.glDisable(gl.GL_DEPTH_TEST)
         gl.glUseProgram(self._program)
-        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uScreen"),
-                       float(self._win_w), float(self._win_h))
-        gl.glUniform1i(gl.glGetUniformLocation(self._program, "uTex"), 0)
+        gl.glUniform2f(self._loc["uScreen"], float(self._win_w), float(self._win_h))
+        gl.glUniform1i(self._loc["uTex"], 0)
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindVertexArray(self._vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._vbo)
@@ -642,7 +683,7 @@ class SettingButtonGroup:
 
             tex = b.tex_on if b.get_state() else b.tex_off
             gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
-            gl.glUniform1f(gl.glGetUniformLocation(self._program, "uAlpha"), float(a))
+            gl.glUniform1f(self._loc["uAlpha"], float(a))
             gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6)
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
@@ -674,6 +715,7 @@ class SettingButtonGroup:
     on_click = handle_click
 
     def destroy(self):
+        self._pending.clear()
         for b in self._buttons:
             _delete_tex(b.tex_off)
             _delete_tex(b.tex_on)

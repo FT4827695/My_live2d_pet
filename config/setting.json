@@ -11,7 +11,7 @@
     "dim_alpha": 0.45
   },
   "chat": {
-    "resize_unlocked": false,
+    "resize_unlocked": true,
     "custom_width": 592,
     "custom_height": 811,
     "custom_display_scale": 1.0

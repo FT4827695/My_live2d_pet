@@ -39,6 +39,7 @@ class BubbleController:
 
         self._pending_text = None
         self._lock = threading.Lock()
+        self._owner_thread = threading.current_thread()
 
     # ==================== 参数同步 ====================
 
@@ -73,6 +74,9 @@ class BubbleController:
 
     def show(self, text, duration=None, vertical_shift=0):
         if not text:
+            return
+        if threading.current_thread() is not self._owner_thread:
+            self.queue(text)
             return
 
         self.renderer.show(

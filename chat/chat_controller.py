@@ -135,6 +135,10 @@ class ChatController:
         try:
             while True:
                 item = self.vm.update_queue.get_nowait()
+                if isinstance(item, tuple) and len(item) == 3 and item[0] == 'add_message':
+                    _, sender, text = item
+                    self.add_message(sender, text)
+                    continue
                 if isinstance(item, tuple) and len(item) == 3 and item[0] == 'stream_chunk':
                     _, idx, chunk = item
                     stream_chunks[idx] = stream_chunks.get(idx, "") + chunk

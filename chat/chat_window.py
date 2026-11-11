@@ -2,6 +2,7 @@ import glfw
 import time
 import math
 import numpy as np
+import threading
 
 from .docs_uploader import DocsUploader
 from .voice_input import VoiceController
@@ -76,6 +77,7 @@ class IndependentChatWindow:
     def __init__(self, main_window_handle, pet_instance, display_scale=1.0):
         self.main_window = main_window_handle
         self.pet = pet_instance
+        self._owner_thread = threading.current_thread()
 
         from display_config import compute_chat_metrics
 
@@ -1342,7 +1344,7 @@ class IndependentChatWindow:
             scroll_manager=self.scroll_manager,
             vm=self.vm,
             doc_uploader=self.doc_uploader,
-            selected_messages=self.selected_messages,
+            selected_messages=set(self.selected_messages),
             recording_status_text=self.voice_ctrl.recording_status_text,
             context_menu=self.menu_manager.context_menu,
             settings_menu=self.menu_manager.settings_menu,
@@ -1373,8 +1375,15 @@ class IndependentChatWindow:
         )
 
     def add_message(self, sender, text):
+        if threading.current_thread() is not self._owner_thread:
+            try:
+                self.vm.update_queue.put(('add_message', sender, text))
+                glfw.post_empty_event()
+            except Exception:
+                pass
+            return
         self.chat_ctrl.add_message(sender, text)
-
+    
     def _refresh_character_ui(self):
         try:
             refresh_character_name()

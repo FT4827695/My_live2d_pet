@@ -38,9 +38,14 @@ class BubbleRenderer:
         self.vao = None
 
         self._font_cache = {}
+        self._u_texture = None
+        self._geom_key = None 
 
     def init(self):
+        if self.shader_prog is not None:
+            return
         self.shader_prog = self._create_shader_program()
+        self._u_texture = gl.glGetUniformLocation(self.shader_prog, "u_texture")
 
         self.vao = gl.glGenVertexArrays(1)
         self.vbo = gl.glGenBuffers(1)
@@ -399,6 +404,7 @@ class BubbleRenderer:
 
         if self.texture is not None:
             gl.glDeleteTextures([self.texture])
+            self.texture = None 
 
         tex_id, w, h = self.create_texture(
             text,
@@ -434,65 +440,53 @@ class BubbleRenderer:
     def draw(self, win_width, win_height):
         if win_width <= 0 or win_height <= 0 or self.texture is None:
             return
-
         if time.time() > self.display_until:
             gl.glDeleteTextures([self.texture])
             self.texture = None
+            self._geom_key = None
             return
-
         if self.shader_prog is None:
             self.init()
 
         x, y = self.position
         w, h = self.width, self.height
 
-        left = (x / win_width) * 2.0 - 1.0
-        right = ((x + w) / win_width) * 2.0 - 1.0
-        bottom = ((win_height - (y + h)) / win_height) * 2.0 - 1.0
-        top = ((win_height - y) / win_height) * 2.0 - 1.0
-
-        vertices = np.array(
-            [
-                left, bottom, 0.0, 0.0,
-                right, bottom, 1.0, 0.0,
-                right, top, 1.0, 1.0,
-                left, top, 0.0, 1.0
-            ],
-            dtype=np.float32
-        )
-
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
-        gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
-
-        gl.glPushAttrib(
-            gl.GL_ENABLE_BIT | gl.GL_POLYGON_BIT | gl.GL_COLOR_BUFFER_BIT
-        )
-        gl.glPushClientAttrib(gl.GL_CLIENT_VERTEX_ARRAY_BIT)
+        key = (x, y, w, h, win_width, win_height)
+        if key != self._geom_key:
+            left = (x / win_width) * 2.0 - 1.0
+            right = ((x + w) / win_width) * 2.0 - 1.0
+            bottom = ((win_height - (y + h)) / win_height) * 2.0 - 1.0
+            top = ((win_height - y) / win_height) * 2.0 - 1.0
+            vertices = np.array(
+                [
+                    left, bottom, 0.0, 0.0,
+                    right, bottom, 1.0, 0.0,
+                    right, top, 1.0, 1.0,
+                    left, top, 0.0, 1.0
+                ],
+                dtype=np.float32
+            )
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+            gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+            self._geom_key = key
 
         gl.glDisable(gl.GL_DEPTH_TEST)
         gl.glDisable(gl.GL_CULL_FACE)
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-
         gl.glUseProgram(self.shader_prog)
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.texture)
-
-        gl.glUniform1i(
-            gl.glGetUniformLocation(self.shader_prog, "u_texture"),
-            0
-        )
-
+        gl.glUniform1i(self._u_texture, 0)
         gl.glBindVertexArray(self.vao)
         gl.glDrawArrays(gl.GL_QUADS, 0, 4)
 
         gl.glBindVertexArray(0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
         gl.glUseProgram(0)
-
-        gl.glPopClientAttrib()
-        gl.glPopAttrib()
-
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        
     def cleanup(self):
         if self.texture is not None:
             gl.glDeleteTextures([self.texture])
@@ -509,3 +503,5 @@ class BubbleRenderer:
         if self.shader_prog is not None:
             gl.glDeleteProgram(self.shader_prog)
             self.shader_prog = None
+        self._u_texture = None
+        self._geom_key = None
