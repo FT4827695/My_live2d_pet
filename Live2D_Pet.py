@@ -74,11 +74,13 @@ class PendingMotion:
     index: Optional[int] = None
     dialog_msg: Optional[str] = None
     sound_group: Optional[str] = None
-
+    
+HEAD_PARTS = {"head", "hair", "face", "eye", "brow", "mouth", "nose", "ear"}
 
 # ==================== 主应用程序类 ====================
 class Live2DPet:
     _json_cache = {}
+    EYE_RECOVER_SEC = 0.60
 
     @classmethod
     def clear_json_cache(cls):
@@ -122,6 +124,11 @@ class Live2DPet:
         self.pending_motion: Optional[PendingMotion] = None
         self.current_expression = "f01"
         self.next_expression_time = 0.0
+
+        # ===== 眨眼分段托管 =====
+        self._blink_owned = False
+        self._eye_recover = None
+        self._current_motion = None
 
         self.smooth_cursor_x = 0.0
         self.smooth_cursor_y = 0.0
@@ -249,7 +256,7 @@ class Live2DPet:
                 pass
             
     # ==================== 音效初始化与播放 ====================
-    def init_audio(self):            
+    def init_audio(self):
         if self._audio_ready:
             return
         try:
@@ -257,42 +264,65 @@ class Live2DPet:
         except pygame.error as e:
             print(f"[音效] Pygame 初始化失败，音频功能将被禁用: {e}")
             return
-            
         ctx = self.current_context
-        if not ctx or not ctx.sound_dir or not ctx.sound_map:
-            print("[音效] 当前模型无音效配置")
+        if ctx is None:
+            print("[音效] 无模型上下文")
             return
-
-        for semantic, base in ctx.sound_map.items():
-            pattern = os.path.join(ctx.sound_dir, f"{base}_*.mp3")
-            found_files = glob.glob(pattern)
-            if not found_files:
-                continue
-            for path in found_files:
+        ctx.ensure_derived()
+        has_auto = ctx.has_any_sound()
+        has_legacy = bool(ctx.sound_dir and ctx.sound_map)
+        if not has_auto and not has_legacy:
+            print("[音效] 当前模型无音效")
+            return
+        # 1) 按动作音频（model.json 声明 / 同名匹配）
+        for group, paths in ctx.motion_sounds.items():
+            for idx, path in enumerate(paths):
+                if not path:
+                    continue
                 try:
-                    filename = os.path.splitext(os.path.basename(path))[0]
-                    parts = filename.split("_")
-                    if len(parts) == 2 and parts[1].isdigit():
-                        key = f"{parts[0]}_{int(parts[1])}"
-                    else:
-                        key = filename
-                    self.sounds[key] = pygame.mixer.Sound(path)
+                    self.sounds[f"{group}#{idx}"] = pygame.mixer.Sound(path)
                 except Exception as e:
                     print(f"[音效] 加载失败 {path}: {e}")
+        # 2) 兼容 profile 的 base_序号
+        if has_legacy:
+            for semantic, base in ctx.sound_map.items():
+                grp = ctx.get_semantic_group(semantic)
+                pattern = os.path.join(ctx.sound_dir, f"{base}_*.mp3")
+                for path in glob.glob(pattern):
+                    try:
+                        filename = os.path.splitext(os.path.basename(path))[0]
+                        parts = filename.split("_")
+                        if len(parts) == 2 and parts[1].isdigit():
+                            n = int(parts[1])
+                            if f"{grp}#{n}" in self.sounds:
+                                continue
+                            key = f"{parts[0]}_{n}"
+                        else:
+                            key = filename
+                        self.sounds[key] = pygame.mixer.Sound(path)
+                    except Exception as e:
+                        print(f"[音效] 加载失败 {path}: {e}")
         self._audio_ready = True
         print(f"[音效] 已加载 {len(self.sounds)} 个音效")
-
-    def play_sound(self, semantic_group, index):
+        
+    def play_sound(self, semantic_group, index, actual_group=None):
         if not self._audio_ready or setting_button.is_audio_muted() or not self.sounds:
             return
+        # 1) 优先按动作音频
+        if actual_group is not None and index is not None:
+            snd = self.sounds.get(f"{actual_group}#{index}")
+            if snd:
+                snd.play()
+                return
+        # 2) 回退 profile 的 base_序号
         ctx = self.current_context
-        if not ctx: return
+        if not ctx:
+            return
         base = ctx.sound_map.get(semantic_group, semantic_group)
-        key = f"{base}_{index}"
-        snd = self.sounds.get(key)
+        snd = self.sounds.get(f"{base}_{index}")
         if snd:
             snd.play()
-
+            
     def get_dialog_for_sound(self, semantic_group: str, index: int):
         ctx = self.current_context
         if not ctx: return None
@@ -381,6 +411,13 @@ class Live2DPet:
         self.no_auto_expr_until = 0.0
         self.current_expression = "f01"
 
+        # 5. 释放旧模型的派生缓存
+        if self.current_context is not None:
+            self.current_context.release_derived()
+            self._blink_owned = False
+            self._eye_recover = None
+            self._current_motion = None
+        
     def _reload_audio(self):
         self.sounds.clear()
         self._audio_ready = False
@@ -599,11 +636,17 @@ class Live2DPet:
                 # 表情兜底
                 exprs = ctx.expressions if ctx and ctx.expressions else ["f01", "f02", "f03", "f04"]
                 if exprs:
-                    try: self.model.SetExpression(random.choice(exprs))
-                    except: pass
+                    try: 
+                        expr = random.choice(exprs)
+                        self.model.SetExpression(expr)
+                        self.current_expression = expr
+                    except: 
+                        pass
+            
+            self.next_expression_time = time.time() + random.uniform(6, 30)
             return True
         return False
-
+    
     def play_body_click_motion(self):
         if self.model is None: return False
         ctx = self.current_context
@@ -626,6 +669,77 @@ class Live2DPet:
                     return part_id, True
         return hit_parts[0], False
 
+    # ==================== 细粒度命中分类 ====================
+    def classify_hit(self, x, y):
+        if self.model is None:
+            return None
+        ctx = self.current_context
+        try:
+            raw = self.model.HitPart(x, y, topOnly=False) or []
+        except Exception:
+            return None
+
+        veto = ctx.veto_part_keywords if ctx else []
+        if any(any(k.upper() in p.upper() for k in veto) for p in raw):
+            return None
+
+        ignore = ctx.ignore_part_keywords if ctx else []
+        hits = [p for p in raw if not any(k.upper() in p.upper() for k in ignore)]
+
+        if hits:
+            rules = ctx.hit_rules if ctx else []
+            if rules:
+                for rule in rules:
+                    kws = rule.get("keywords", [])
+                    for p in hits:
+                        if any(k.upper() in p.upper() for k in kws):
+                            return rule.get("part")
+            else:
+                head_kw = ctx.head_keywords if ctx else []
+                body_kw = ctx.body_keywords if ctx else []
+                for p in hits:
+                    if any(k.upper() in p.upper() for k in head_kw):
+                        return "head"
+                for p in hits:
+                    if any(k.upper() in p.upper() for k in body_kw):
+                        return "body"
+
+        # 分区兜底
+        if ctx and ctx.hit_mode == "hybrid":
+            w = self._cached_win_w or 1
+            h = self._cached_win_h or 1
+            nx, ny = x / w, y / h
+            for (x0, y0, x1, y1) in ctx.head_zones:
+                if x0 <= nx <= x1 and y0 <= ny <= y1:
+                    return "hair"
+            for (x0, y0, x1, y1) in ctx.body_zones:
+                if x0 <= nx <= x1 and y0 <= ny <= y1:
+                    return "body"
+        return None
+
+    # ==================== 部位动作统一入口 ====================
+    def play_part_motion(self, part):
+        if self.model is None:
+            return False
+        ctx = self.current_context
+        picked = ctx.pick_part_motion(part) if ctx else None
+        if picked is None:
+            if part in HEAD_PARTS:
+                return self.play_head_click_motion()
+            return self.play_body_click_motion()
+
+        group, index = picked
+        msgs = ctx.get_messages(f"tap_{part}")
+        if not msgs:
+            msgs = ctx.get_messages("tap_head" if part in HEAD_PARTS else "tap_body")
+        msg = random.choice(msgs) if msgs else None
+
+        if self.motion_lock:
+            self.pending_motion = PendingMotion(group=group, index=index,
+                                                dialog_msg=msg, sound_group=None)
+            return False
+        return self.start_motion(group, index=index, dialog_msg=msg, sound_group=None)
+    
     # ==================== model.json 缓存 ====================
     def load_model_json(self):
         if self._model_json_dict is not None:
@@ -665,6 +779,7 @@ class Live2DPet:
         self.motion_lock = False
         self.last_user_action_end_time = time.time()
         self.motion_transition_end = time.time() + 0.3
+        self._begin_eye_recover(group, no)
 
         if self.pending_motion is not None:
             pm = self.pending_motion
@@ -690,17 +805,22 @@ class Live2DPet:
             
         try:
             self.model.StartMotion(actual_group, index, priority=3, onFinishMotionHandler=self._on_finish_motion)
+            self._current_motion = (actual_group, index)
+            self._eye_recover = None
+            self._set_auto_blink(False)
             
             # 从 context 获取时长
-            duration = lock_duration if lock_duration else (ctx.get_motion_duration(actual_group) if ctx else 3.0)
+            duration = lock_duration if lock_duration else (
+                ctx.get_motion_duration(actual_group, index) if ctx else 3.0
+            )
             self.lock_end_time = time.time() + duration + 1.0
             self.motion_lock = True
             self.last_interaction_time = time.time()
             
             if sound_group:
-                self.play_sound(sound_group, index)
+                self.play_sound(sound_group, index, actual_group)
                 self.no_auto_expr_until = time.time() + duration + 0.5
-                
+            
             final_msg = dialog_msg
             if final_msg is None and sound_group is not None and index is not None:
                 final_msg = self.get_dialog_for_sound(sound_group, index)
@@ -810,6 +930,7 @@ class Live2DPet:
             return False
             
         self.current_context = context
+        context.ensure_derived() 
         self.model = live2d.LAppModel()
         try:
             self.model.LoadModelJson(context.model_json_path)
@@ -831,6 +952,7 @@ class Live2DPet:
             try:
                 self.model.SetAutoBlinkEnable(True)
                 self.model.SetAutoBreathEnable(True)
+                self._blink_owned = False
             except Exception as e:
                 print(f"[呼吸/眨眼] 启用失败: {e}")
         except Exception as e:
@@ -841,7 +963,60 @@ class Live2DPet:
         self._apply_character(context)
         self._reload_audio()
         return True
-        
+
+    # ==================== 眨眼分段托管 ====================
+    def _set_auto_blink(self, enabled: bool):
+        if self.model is None:
+            return
+        if self._blink_owned == (not enabled):
+            return
+        try:
+            self.model.SetAutoBlinkEnable(enabled)
+            self._blink_owned = (not enabled)
+        except Exception:
+            pass
+
+    def _begin_eye_recover(self, group, index):
+        self._current_motion = None
+        ctx = self.current_context
+        if ctx is None or self.model is None:
+            self._eye_recover = None
+            self._set_auto_blink(True)
+            return
+        need, start_vals = ctx.get_eye_recovery(group, index)
+        if not need:
+            self._eye_recover = None
+            self._set_auto_blink(True)
+            return
+        self._eye_recover = {
+            "t0": time.time(),
+            "dur": self.EYE_RECOVER_SEC,
+            "from": start_vals,
+            "to": ctx.eye_neutral,
+        }
+        self._set_auto_blink(False)
+
+    def _update_eye_recover(self):
+        rec = self._eye_recover
+        if rec is None or self.model is None:
+            return
+        t = (time.time() - rec["t0"]) / rec["dur"]
+        if t >= 1.0:
+            for p in rec["from"]:
+                try:
+                    self.model.SetParameterValue(p, rec["to"])
+                except Exception:
+                    pass
+            self._eye_recover = None
+            self._set_auto_blink(True)
+            return
+        k = 1.0 - (1.0 - t) ** 3
+        for p, v0 in rec["from"].items():
+            try:
+                self.model.SetParameterValue(p, v0 + (rec["to"] - v0) * k)
+            except Exception:
+                pass
+            
     # ==================== 参数平滑 ====================
     def update_parameters_smooth(self):
         win_w = self._cached_win_w
@@ -946,21 +1121,22 @@ class Live2DPet:
                 # 自动表情切换（空闲时）
                 if (
                     not self.motion_lock
-                    and now >= self.motion_transition_end
-                    and now >= self.next_expression_time
-                    and now >= self.no_auto_expr_until
+                    and now - self.last_idle_time >= self.idle_interval
+                    and now - self.last_user_action_end_time >= self.idle_after_user_cooldown
                 ):
-                    try:
-                        self.model.SetRandomExpression()
-                    except Exception:
-                        ctx = self.current_context
-                        exprs = ctx.expressions if ctx and ctx.expressions else ["f01", "f02", "f03", "f04"]
-                        if exprs:
-                            try: self.model.SetExpression(random.choice(exprs))
-                            except: pass
-                        
-                    self.next_expression_time = now + random.uniform(6, 30)
-
+                    ctx = self.current_context
+                    msgs = ctx.get_messages("idle") if ctx else []
+                    msg = random.choice(msgs) if msgs and random.random() < 0.3 else None
+                    picked = ctx.pick_idle() if ctx else None
+                    if picked:
+                        g, i = picked
+                        ok = self.start_motion(g, index=i, dialog_msg=msg)
+                    else:
+                        ok = self.start_motion("idle", dialog_msg=msg)
+                    if ok:
+                        self.last_idle_time = now
+                        self.idle_interval = random.uniform(30, 60)
+                    
                 # 硬件报警气泡
                 alert_msg = self.hardware_monitor.take_alert_message()
                 if alert_msg:
@@ -972,7 +1148,13 @@ class Live2DPet:
                     self.motion_lock = False
                     self.last_user_action_end_time = time.time()
                     self.motion_transition_end = time.time() + 0.5
-
+                    if self._current_motion is not None:
+                        g, i = self._current_motion
+                        self._begin_eye_recover(g, i)
+                    if (self._blink_owned and not self.motion_lock
+                            and self._eye_recover is None and self._current_motion is None):
+                        self._set_auto_blink(True)
+                
                     if self.pending_motion is not None:
                         pm = self.pending_motion
                         self.pending_motion = None
@@ -1002,7 +1184,30 @@ class Live2DPet:
                         self.idle_interval = random.uniform(30, 60)
 
                 self.update_parameters_smooth()
+                self._update_eye_recover()
 
+                if (not self.motion_lock and 
+                    self._eye_recover is None and 
+                    now > self.next_expression_time):
+                    
+                    ctx = self.current_context
+                    if ctx and ctx.expressions:
+                        available = [e for e in ctx.expressions if e != self.current_expression]
+                        if available:
+                            expr = random.choice(available)
+                            try:
+                                self.model.SetExpression(expr)
+                                self.current_expression = expr
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            self.model.SetRandomExpression()
+                        except Exception:
+                            pass
+                    
+                    self.next_expression_time = now + random.uniform(6, 30)
+                    
                 chat_active = bool(
                     self.chat_window is not None and getattr(self.chat_window, "active", False)
                 )
