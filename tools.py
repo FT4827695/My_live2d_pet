@@ -447,6 +447,34 @@ class ToolLoopDriver:
             if stats is not None:
                 stats.record_raw_dict(resp, messages=current_messages)
 
+            # ===== 处理 arguments 坏掉的返回 =====
+            if resp.get("_tool_args_broken"):
+                broken_content = resp.get("content", "")
+
+                current_messages.append({
+                    "role": "assistant",
+                    "content": broken_content or "（上一次输出因过长被截断）",
+                })
+                current_messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统提示] 上一次 execute_python_code 的 code 参数太长，"
+                        "生成被截断导致 JSON 非法，工具没有执行。\n"
+                        "本次请务必遵守：\n"
+                        "1) 删除所有解释性注释；\n"
+                        "2) 重新调用 execute_python_code。"
+                    ),
+                })
+
+                tool_trace.append({
+                    "name": "execute_python_code",
+                    "args": {"_broken": True},
+                    "ok": False,
+                    "result_head": "arguments JSON 非法（生成被截断）",
+                })
+
+                continue 
+
             content = resp.get("content", "")
             tool_calls = resp.get("tool_calls")
             reasoning = resp.get("reasoning_content", "")

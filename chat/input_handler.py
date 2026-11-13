@@ -83,6 +83,9 @@ class InputHandler:
         # 搜索 API 编辑弹窗（由 chat_window 注入）
         self.search_api_editor = None
 
+        # 模型高级设置弹窗（由 chat_window 注入）
+        self.model_params_editor = None
+
         # 聊天窗口大小拖曳控制器（由 chat_window 注入）
         self._resize_controller = resize_controller
         
@@ -206,6 +209,11 @@ class InputHandler:
         if not paths:
             return
 
+        for editor_attr in ("character_editor", "search_api_editor", "model_params_editor"):
+            editor = getattr(self, editor_attr, None)
+            if editor is not None and getattr(editor, "visible", False):
+                return
+            
         mx, my = glfw.get_cursor_pos(window)
         rx, ry = int(mx), int(my)
         if not (
@@ -255,6 +263,13 @@ class InputHandler:
         api_editor = getattr(self, "search_api_editor", None)
         if api_editor is not None and api_editor.visible:
             api_editor.handle_mouse_button(button, action, mods, rx, ry)
+            self._request_update()
+            self._mark_dirty()
+            return
+
+        params_editor = getattr(self, "model_params_editor", None)
+        if params_editor is not None and params_editor.visible:
+            params_editor.handle_mouse_button(button, action, mods, rx, ry)
             self._request_update()
             self._mark_dirty()
             return
@@ -572,6 +587,10 @@ class InputHandler:
         if api_editor is not None and api_editor.visible:
             return
 
+        params_editor = getattr(self, "model_params_editor", None)
+        if params_editor is not None and params_editor.visible:
+            return
+
         # ---------- 聊天窗口大小拖曳移动 ----------
         if self._resize_controller and self._resize_controller.is_resize_press_active:
             self._resize_controller.move_resize_drag(rx, ry)
@@ -744,6 +763,13 @@ class InputHandler:
             self._mark_dirty()
             return
 
+        params_editor = getattr(self, "model_params_editor", None)
+        if params_editor is not None and params_editor.visible:
+            params_editor.handle_key(key, scancode, action, mods)
+            self._request_update()
+            self._mark_dirty()
+            return
+
         # ---------- 聊天窗口大小拖曳拦截 ----------
         if self._resize_controller and self._resize_controller.is_resize_press_active:
             if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
@@ -882,6 +908,14 @@ class InputHandler:
                 self._request_update()
                 self._mark_dirty()
             return
+
+        params_editor = getattr(self, "model_params_editor", None)
+        if params_editor is not None and params_editor.visible:
+            if codepoint >= 32:
+                params_editor.handle_char(chr(codepoint))
+                self._request_update()
+                self._mark_dirty()
+            return
         
         if not self._get_input_focus():
             return
@@ -912,6 +946,15 @@ class InputHandler:
             x, y = glfw.get_cursor_pos(win)
             rx, ry = int(x), int(y)
             api_editor.handle_scroll(rx, ry, xoff, yoff)
+            self._request_update()
+            self._mark_dirty()
+            return
+
+        params_editor = getattr(self, "model_params_editor", None)
+        if params_editor is not None and params_editor.visible:
+            x, y = glfw.get_cursor_pos(win)
+            rx, ry = int(x), int(y)
+            params_editor.handle_scroll(rx, ry, xoff, yoff)
             self._request_update()
             self._mark_dirty()
             return

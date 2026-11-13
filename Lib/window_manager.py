@@ -102,7 +102,7 @@ class WindowManager:
         self._setup_win32_window()
 
         glfw.make_context_current(self.window)
-        glfw.swap_interval(1)
+        glfw.swap_interval(0)
 
         self._init_gl_backend()
         self._init_live2d()

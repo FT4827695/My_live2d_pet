@@ -239,6 +239,22 @@ class IndependentChatWindow:
 
         # 设置菜单点击“模型人设”时打开编辑弹窗
         self.menu_manager.on_open_character_editor = self.character_editor.open
+
+        # 模型高级设置弹窗
+        from .model_params_editor import ModelParamsEditor
+
+        self.model_params_editor = ModelParamsEditor(
+            model_settings=self.menu_manager.model_settings,
+            get_font=get_font,
+            scale=self.scale,
+            width=self.width,
+            height=self.height,
+            font_sizes=self.font_sizes,
+            request_update=self._request_ui_update,
+            mark_dirty=self.mark_dirty,
+            add_message=self.add_message,
+        )
+        self.menu_manager.on_open_model_params_editor = self.model_params_editor.open
         
         # 搜索 API 编辑弹窗
         self.search_api_editor = SearchApiEditor(
@@ -340,10 +356,12 @@ class IndependentChatWindow:
         )
         self.input_handler.register_callbacks()
 
-        # 人设编辑弹窗事件路由
+        # 编辑弹窗事件路由
         self.input_handler.character_editor = getattr(self, "character_editor", None)
         
         self.input_handler.search_api_editor = getattr(self, "search_api_editor", None)
+
+        self.input_handler.model_params_editor = getattr(self, "model_params_editor", None)
         
         # 4. 初始化渲染管线
         self.render_pipeline = RenderPipeline(
@@ -824,6 +842,9 @@ class IndependentChatWindow:
                 return False
             if getattr(self.search_api_editor, "visible", False):
                 return False
+            if getattr(self, "model_params_editor", None) is not None \
+                    and getattr(self.model_params_editor, "visible", False):
+                return False            
         except Exception:
             pass
 
@@ -1251,7 +1272,7 @@ class IndependentChatWindow:
             pass
 
         # ---------- 更新编辑弹窗 ----------
-        for editor_attr in ("character_editor", "search_api_editor"):
+        for editor_attr in ("character_editor", "search_api_editor", "model_params_editor"):
             editor = getattr(self, editor_attr, None)
             if editor is None:
                 continue
@@ -1372,6 +1393,7 @@ class IndependentChatWindow:
             layout_snapshot=self.layout_manager.snapshot,
             character_editor=getattr(self, "character_editor", None),
             search_api_editor=getattr(self, "search_api_editor", None),
+            model_params_editor=getattr(self, "model_params_editor", None),
         )
 
     def add_message(self, sender, text):
@@ -1513,6 +1535,8 @@ class IndependentChatWindow:
             self.character_editor.close()
         if getattr(self, "search_api_editor", None) is not None:
             self.search_api_editor.close()
+        if getattr(self, "model_params_editor", None) is not None:
+            self.model_params_editor.close()
             
         # 窗口显示（位置计算 + show_window + active=True）
         self.win_mgr.show()
@@ -1549,6 +1573,8 @@ class IndependentChatWindow:
             self.character_editor.close()
         if getattr(self, "search_api_editor", None) is not None:
             self.search_api_editor.close()
+        if getattr(self, "model_params_editor", None) is not None:
+            self.model_params_editor.close()
             
         if self.input_handler:
             self.input_handler.reset_state()
@@ -1596,6 +1622,11 @@ class IndependentChatWindow:
         api_editor = getattr(self, "search_api_editor", None)
         if api_editor is not None and getattr(api_editor, "visible", False):
             api_editor.update_cursor_blink(current_time)
+            return
+
+        params_editor = getattr(self, "model_params_editor", None)
+        if params_editor is not None and getattr(params_editor, "visible", False):
+            params_editor.update_cursor_blink(current_time)
             return
         
         if not self.input_focus:

@@ -19,13 +19,10 @@ CTX_OPTIONS = [
     49152,
     122880
 ]
-KV_CACHE_OPTIONS = [
-    "f16",
-    "q8_0",
-    "iq4_nl",
-    "q4_0",
-    "q8_iq4", 
-]
+# 菜单：精简三档
+KV_CACHE_OPTIONS = ["f16", "q8_0", "q4_0"]
+# 弹窗：完整五档
+KV_CACHE_OPTIONS_FULL = ["f16", "q8_0", "iq4_nl", "q4_0", "q8_iq4"]
 TEMPERATURE_OPTIONS = [
     0.0,
     0.3,
@@ -34,20 +31,13 @@ TEMPERATURE_OPTIONS = [
     1.0,
 ]
 VRAM_EXTRA_OPTIONS = [
-    -512,
     -256,
     0,
     512,
     768,
-    1024
 ]
-MTP_OPTIONS = [
-    0,
-    1,
-    2,
-    4,
-]
-
+MTP_OPTIONS = [0, 1, 2]
+MTP_OPTIONS_FULL = list(range(9))
 
 def _get_root_dir() -> str:
     if getattr(sys, "frozen", False):
@@ -70,11 +60,16 @@ class ModelSettings:
         "vram_extra_mb": 0,
         "enable_thinking": False,
         "mtp": 0,
-        "voice_enabled": True,       # 全局语音开关
-        "voice_shortcut": "wheel",   # 录音快捷键（'wheel' 或 'off'）
+        "voice_enabled": True,
+        "voice_shortcut": "wheel",
         "mixed_kv_ratio": 0.99,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "top_k": 40,
+        "top_p": 0.95,
+        "min_p": 0.05,
     }
-
+    
     def __init__(self, path: Optional[str] = None):
         self.path = path or _get_model_settings_path()
         self.data: Dict[str, Any] = dict(self.DEFAULTS)
@@ -161,14 +156,36 @@ class ModelSettings:
             mixed_kv_ratio = self.DEFAULTS["mixed_kv_ratio"]
         os.environ["XLLAMA_MIXED_KV_RATIO"] = str(mixed_kv_ratio)
 
+        def _f(key, default):
+            try:
+                return float(self.data.get(key, default))
+            except Exception:
+                return float(default)
+
+        def _i(key, default):
+            try:
+                return int(self.data.get(key, default))
+            except Exception:
+                return int(default)
+
+        os.environ["XLLAMA_REPEAT_PENALTY"] = str(_f("repeat_penalty", 1.0))
+        os.environ["XLLAMA_PRESENCE_PENALTY"] = str(_f("presence_penalty", 0.0))
+        os.environ["XLLAMA_TOP_K"] = str(_i("top_k", 40))
+        os.environ["XLLAMA_TOP_P"] = str(_f("top_p", 0.95))
+        os.environ["XLLAMA_MIN_P"] = str(_f("min_p", 0.05))
+        
         print(
             f"[MenuManager] 已应用加载参数 "
             f"CTX={ctx}, KV Cache={kv_cache}, "
             f"Temperature={temperature}, VRAM Extra={vram_extra_mb} MB, "
             f"Enable Thinking={enable_thinking}, "
-            f"MTP={mtp if mtp > 0 else '关闭'}"
+            f"MTP={mtp if mtp > 0 else '关闭'}, "
+            f"Repeat={os.environ['XLLAMA_REPEAT_PENALTY']}, "
+            f"Present={os.environ['XLLAMA_PRESENCE_PENALTY']}, "
+            f"TopK={os.environ['XLLAMA_TOP_K']}, "
+            f"TopP={os.environ['XLLAMA_TOP_P']}, "
+            f"MinP={os.environ['XLLAMA_MIN_P']}"
         )
-
 
 class MenuManager:
     def __init__(
@@ -239,6 +256,9 @@ class MenuManager:
 
         # 打开人设编辑弹窗回调
         self.on_open_character_editor: Optional[Callable[[], None]] = None
+
+        # 打开模型高级设置弹窗回调
+        self.on_open_model_params_editor: Optional[Callable[[], None]] = None
         
     # ==================== 上下文菜单 ====================
     def show_context_menu(self, x: int, y: int) -> None:
@@ -431,6 +451,7 @@ class MenuManager:
                     {"id": "param_vram", "text": indent + f"显存调整: {self._format_vram_extra(vram_value)}", "enabled": can_change_params},
                     {"id": "param_think", "text": indent + f"思考: {self._format_enable_thinking(thinking_value)}", "enabled": can_change_params},
                     {"id": "param_mtp", "text": indent + f"MTP: {self._format_mtp(mtp_value)}", "enabled": can_change_params},
+                    {"id": "advanced_params", "text": indent + "高级设置…", "enabled": can_change_params},
                     {"id": "sep_params", "text": "", "enabled": False},
                 ]
             )
@@ -571,13 +592,19 @@ class MenuManager:
         if not self._can_change_params():
             return
         current = self._get_int_setting(key, fallback)
-        if current in options:
-            next_value = options[(options.index(current) + 1) % len(options)]
+
+        cycle = list(options)
+        if current not in cycle:
+            cycle.append(current)
+
+        if current in cycle:
+            next_value = cycle[(cycle.index(current) + 1) % len(cycle)]
         else:
             next_value = fallback if fallback in options else options[0]
+
         display_value = formatter(next_value) if formatter else str(next_value)
         self._save_and_announce(key, next_value, label, display_value)
-
+        
     def _cycle_float_option(
         self,
         key: str,
@@ -589,14 +616,20 @@ class MenuManager:
         if not self._can_change_params():
             return
         current = self._get_float_setting(key, fallback)
+
+        cycle = list(options)
+        if not any(abs(float(o) - current) < 1e-9 for o in cycle):
+            cycle.append(current)
+
         current_index = None
-        for i, opt in enumerate(options):
+        for i, opt in enumerate(cycle):
             try:
                 if abs(float(opt) - current) < 1e-9:
                     current_index = i
                     break
             except Exception:
                 pass
+
         if current_index is None:
             next_value = options[0]
             for opt in options:
@@ -607,10 +640,11 @@ class MenuManager:
                 except Exception:
                     pass
         else:
-            next_value = options[(current_index + 1) % len(options)]
+            next_value = cycle[(current_index + 1) % len(cycle)]
+
         display_value = formatter(next_value) if formatter else str(next_value)
         self._save_and_announce(key, next_value, label, display_value)
-
+        
     def _cycle_str_option(
         self,
         key: str,
@@ -622,14 +656,20 @@ class MenuManager:
         if not self._can_change_params():
             return
         current = str(self.model_settings.data.get(key, "")).strip().lower()
-        if current in options:
-            next_value = options[(options.index(current) + 1) % len(options)]
+
+        cycle = list(options)
+        if current and current not in cycle:
+            cycle.append(current)
+
+        if current in cycle:
+            next_value = cycle[(cycle.index(current) + 1) % len(cycle)]
         else:
             fallback_value = str(fallback).strip().lower()
             next_value = fallback_value if fallback_value in options else options[0]
+
         display_value = formatter(next_value) if formatter else str(next_value)
         self._save_and_announce(key, next_value, label, display_value)
-
+        
     def _cycle_ctx(self) -> None:
         self._cycle_int_option(key="ctx", options=CTX_OPTIONS, label="CTX", fallback=8192)
 
@@ -814,6 +854,13 @@ class MenuManager:
             if self.on_open_search_api_editor is not None:
                 self.on_open_search_api_editor()
             self.hide_settings_menu(force=True)
+            return
+
+        if cmd == "advanced_params":
+            if self._can_change_params():
+                if self.on_open_model_params_editor is not None:
+                    self.on_open_model_params_editor()
+                self.hide_settings_menu(force=True)
             return
         
         if cmd == "character_file":

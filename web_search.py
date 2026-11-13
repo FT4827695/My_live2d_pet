@@ -1140,7 +1140,6 @@ class WebSearchEngine:
 
         unwrapped, reason = self._unwrap_redirect_url(url)
         if reason in ("b64", "302", "meta", "js") and unwrapped != url:
-            print(f"[WebSearch] 解跳转({reason}): {url[:56]}… → {unwrapped[:72]}…")
             new_info = dict(info)
             new_info["url"] = unwrapped
             fetch_info = dict(new_info.get("fetch_info") or {})
@@ -1148,7 +1147,6 @@ class WebSearchEngine:
             new_info["fetch_info"] = fetch_info
             return new_info, unwrapped
         if reason == "fail":
-            print(f"[WebSearch] 解跳转失败，按原 URL 尝试：{url[:80]}")
         return info, url
     
     # ---------- 搜索 ----------

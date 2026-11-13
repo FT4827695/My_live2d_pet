@@ -481,6 +481,34 @@ class _RealXllamaEngine:
                 import traceback
                 traceback.print_exc()
 
+        # ==========================================================
+        # 采样参数
+        # ==========================================================
+        def _env_float(name, default):
+            try:
+                return float(os.environ.get(name, str(default)))
+            except Exception:
+                return float(default)
+
+        def _env_int(name, default):
+            try:
+                return int(os.environ.get(name, str(default)))
+            except Exception:
+                return int(default)
+
+        s = params.sampling
+        s.temp = _env_float("XLLAMA_TEMPERATURE", 0.7)
+        s.penalty_repeat = _env_float("XLLAMA_REPEAT_PENALTY", 1.0)
+        s.penalty_present = _env_float("XLLAMA_PRESENCE_PENALTY", 0.0)
+        s.top_k = _env_int("XLLAMA_TOP_K", 40)
+        s.top_p = _env_float("XLLAMA_TOP_P", 0.95)
+        s.min_p = _env_float("XLLAMA_MIN_P", 0.05)
+
+        print(
+            f"[采样] temp={s.temp:g}, repeat={s.penalty_repeat:g}, "
+            f"present={s.penalty_present:g}, top_k={s.top_k}, "
+            f"top_p={s.top_p:g}, min_p={s.min_p:g}"
+        )
         return params
 
     # ----------------------------------------------------------
@@ -572,7 +600,6 @@ class _RealXllamaEngine:
         payload = {
             "messages": msgs,
             "max_tokens": getattr(self, 'max_gen_tokens', 2048),
-            "temperature": _get_temperature_from_env(),
             "stream": True,
         }
 
@@ -595,9 +622,10 @@ class _RealXllamaEngine:
         payloads = [
             self._build_chat_payload(msgs, enable, True, tools),
             self._build_chat_payload(msgs, enable, False, tools),
-            self._build_chat_payload(msgs, not enable, True, tools),
         ]
 
+        if enable:
+            payloads.append(self._build_chat_payload(msgs, False, True, tools))
         return payloads
 
     def _run_chat_completion_with_fallback(self, msgs, tools=None):
@@ -677,6 +705,22 @@ class _RealXllamaEngine:
                 return result, abort_triggered
 
             except Exception as e:
+                err_text = str(e)
+
+                if "parse tool call arguments as JSON" in err_text:
+                    print(
+                        f"[Worker] tool call arguments 非法 JSON"
+                        f"（可能是生成被截断，第 {idx + 1} 次尝试）: "
+                        f"{err_text[:300]}"
+                    )
+                    return {
+                        "content": "".join(collected_text).strip(),
+                        "reasoning_content": "".join(collected_reasoning).strip(),
+                        "tool_calls": None,
+                        "usage": usage_holder.get("usage"),
+                        "_tool_args_broken": True,
+                    }, abort_triggered
+
                 if collected_text or abort_triggered or self.abort_event.is_set():
                     result = {
                         "content": "".join(collected_text).strip(),
@@ -687,11 +731,11 @@ class _RealXllamaEngine:
                     return result, abort_triggered
 
                 if idx < len(payloads) - 1:
-                    print(f"[Worker] enable_thinking 兼容回退 {idx + 1}: {e}")
+                    print(f"[Worker] enable_thinking 兼容回退 {idx + 1}: {err_text}")
                     continue
 
-                print(f"[Worker] 推理请求失败: {e}")
-
+                print(f"[Worker] 推理请求失败: {err_text}")
+                
         return {"content": "", "reasoning_content": "", "tool_calls": None, "usage": None}, False
 
     def _run_stream_completion_with_fallback(self, req_id, res_queue, msgs):

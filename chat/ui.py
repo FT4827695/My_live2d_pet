@@ -120,6 +120,7 @@ class RenderContext:
     layout_snapshot: Optional[Any] = None
     character_editor: Optional[Any] = None
     search_api_editor: Optional[Any] = None
+    model_params_editor: Optional[Any] = None
 
     def get_text_width(self, text: str) -> float:
         return self.font.getlength(text) if hasattr(self.font, 'getlength') else self.font.getsize(text)[0]
@@ -687,6 +688,11 @@ class ChatUIRenderer:
         if api_editor is not None and getattr(api_editor, "visible", False):
             api_editor.render(img, draw, ctx)
             return RenderResult(cursor_rect=None)
+
+        params_editor = getattr(ctx, "model_params_editor", None)
+        if params_editor is not None and getattr(params_editor, "visible", False):
+            params_editor.render(img, draw, ctx)
+            return RenderResult(cursor_rect=None)
         
         # 返回光标矩形（宽度留空，由窗口补全）
         return RenderResult(cursor_rect=cursor_rect)
@@ -725,6 +731,10 @@ class ChatUIRenderer:
 
         api_editor = getattr(ctx, "search_api_editor", None)
         if api_editor is not None and getattr(api_editor, "visible", False):
+            return
+
+        params_editor = getattr(ctx, "model_params_editor", None)
+        if params_editor is not None and getattr(params_editor, "visible", False):
             return
 
         side = getattr(ctx, "resize_grip_side", "right")
@@ -863,6 +873,10 @@ class ChatUI:
         api_editor = getattr(ctx, "search_api_editor", None)
         if api_editor is not None and getattr(api_editor, "visible", False):
             return api_editor.hit_test(x, y, ctx, is_click=is_click)
+
+        params_editor = getattr(ctx, "model_params_editor", None)
+        if params_editor is not None and getattr(params_editor, "visible", False):
+            return params_editor.hit_test(x, y, ctx, is_click=is_click)
         
         # 计算所有按钮位置（与渲染保持一致）
         hdr = compute_header_rects(ctx.width, ctx.scale)
