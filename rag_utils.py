@@ -3,6 +3,33 @@ import re
 import pandas as pd
 import time
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+def _pagination_enabled() -> bool:
+    return os.environ.get("XLLAMA_DOC_PAGINATION", "1").strip().lower() not in (
+        "0", "false", "no", "off"
+    )
+
+def _get_page_chars() -> int:
+    target = _env_int("XLLAMA_DOC_PAGE_CHARS", 12000)
+    if target <= 0:
+        target = 12000
+    factor = _env_float("XLLAMA_DOC_PAGE_CTX_FACTOR", 0.5)
+    if factor > 0:
+        ceiling = int(_env_int("XLLAMA_CTX", 8192) * factor)
+        if ceiling > 0:
+            target = min(target, ceiling)
+    return max(500, target)
 
 class AttachmentCachePool:
     TYPE_LABELS = {
@@ -154,6 +181,34 @@ class AttachmentCachePool:
             return True
 
         return False
+
+    # ==================== 分页 ====================
+    @staticmethod
+    def _build_page_cuts(body: str, page_chars: int) -> list:
+        total = len(body)
+        cuts = [0]
+        pos = 0
+        lookback = max(1, page_chars // 5)
+        while pos < total:
+            end = min(pos + page_chars, total)
+            if end < total:
+                lo = max(pos + 1, end - lookback)
+                idx = body.rfind("\n", lo, end)
+                if idx >= 0:
+                    end = idx + 1
+            if end <= pos:
+                end = min(pos + page_chars, total)
+            cuts.append(end)
+            pos = end
+        return cuts
+
+    def _get_page_cuts(self, entry: dict, body: str, page_chars: int) -> list:
+        cached = entry.get("_page_cuts")
+        if cached and cached[0] == page_chars and cached[1] == len(body):
+            return cached[2]
+        cuts = self._build_page_cuts(body, page_chars)
+        entry["_page_cuts"] = (page_chars, len(body), cuts)
+        return cuts
     
     # ==================== 读取 ====================
 
@@ -230,9 +285,10 @@ class AttachmentCachePool:
         return result
     
     # ==================== 关键词检索 ====================
-
     def search_by_keywords(self, query: str, top_k: int = 2) -> list:
         query_terms = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+', query.lower()))
+        if not query_terms:
+            return []
         scored = []
         for key, entry in self._entries.items():
             meta = entry.get("meta") or {}
@@ -243,18 +299,23 @@ class AttachmentCachePool:
             content_score = 0
             if att_type == "markdown":
                 data = entry.get("data", "")
-                if isinstance(data, str):
+                if isinstance(data, str) and data:
+                    cached = entry.get("_data_lower")
+                    if cached is None or cached[0] != len(data):
+                        cached = (len(data), data.lower())
+                        entry["_data_lower"] = cached
+                    data_lower = cached[1]
                     for term in query_terms:
-                        content_score += data.lower().count(term)
+                        content_score += data_lower.count(term)
             total_score = name_score * 10 + content_score
             if total_score > 0:
                 scored.append((key, total_score, entry))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [item[0] for item in scored[:top_k]]
-
+    
     # ==================== 按编号读取 ====================
 
-    def retrieve(self, file_no) -> dict:
+    def retrieve(self, file_no, page=None) -> dict:
         key = str(file_no)
         entry = self._entries.get(key)
 
@@ -298,33 +359,97 @@ class AttachmentCachePool:
 
         elif att_type == "markdown":
             data = entry.get("data")
+            body = data if isinstance(data, str) else ""
             scan_info = meta.get("pdf_scan_info") or {}
             scan_notice = self._format_pdf_scan_notice(scan_info)
 
-            if not isinstance(data, str) or not data.strip():
-                if scan_notice:
-                    data = scan_notice
-                else:
-                    return {"ok": False, "error": "该文档内容为空", "file_no": file_no}
+            if not body.strip() and not scan_notice:
+                return {"ok": False, "error": "该文档内容为空", "file_no": file_no}
 
             entry["read_status"] = "read"
             if self._is_doc_type(entry.get("type", "markdown")):
                 entry["filename_disclosed"] = True
 
-            content = data
+            if not _pagination_enabled():
+                content = body
+                if scan_notice and scan_notice not in content:
+                    content += "\n\n" + scan_notice
+                return {
+                    "ok": True,
+                    "type": "markdown",
+                    "display_name": self._display_name(entry, file_no),
+                    "content": content,
+                    "file_no": file_no,
+                    "error": None,
+                }
 
-            if scan_notice and scan_notice not in content:
-                content += "\n\n" + scan_notice
+            total_chars = len(body)
+            original_chars = meta.get("doc_original_chars") or total_chars
+            upload_truncated = bool(meta.get("doc_upload_truncated", False))
+            header_lines = []
+
+            if total_chars == 0:
+                page_no, total_pages = 1, 1
+                segment = ""
+                header_lines.append("[读取信息] 该文档没有可用文本。")
+            else:
+                page_chars = _get_page_chars()
+                cuts = self._get_page_cuts(entry, body, page_chars)
+                total_pages = len(cuts) - 1
+                try:
+                    page_no = 1 if page is None else int(page)
+                except Exception:
+                    page_no = 1
+                if page_no < 1 or page_no > total_pages:
+                    return {
+                        "ok": False,
+                        "error": f"页码超出范围：该文档共 {total_pages} 页，请求的是第 {page_no} 页。",
+                        "next_action": (
+                            f"请把 page 改为 1 到 {total_pages} 之间的整数后重新调用 read_cached_file。"
+                        ),
+                        "file_no": file_no,
+                    }
+                start, end = cuts[page_no - 1], cuts[page_no]
+                segment = body[start:end]
+                if total_pages == 1:
+                    header_lines.append(f"[读取信息] 全文 {total_chars} 字，已完整返回。")
+                else:
+                    header_lines.append(
+                        f"[读取信息] 全文 {total_chars} 字，本次返回第 {page_no}/{total_pages} 页"
+                        f"（第 {start + 1}–{end} 字），剩余 {total_pages - page_no} 页。"
+                    )
+                    if page_no < total_pages:
+                        header_lines.append(
+                            f"[续读] read_cached_file(file_no={file_no}, page={page_no + 1})"
+                        )
+                    header_lines.append("[说明] 若当前内容已足够回答，可不再续读。")
+
+            if upload_truncated:
+                header_lines.append(
+                    f"[注意] 原始文档共 {original_chars} 字，入库时按上限只保留了前 {total_chars} 字，"
+                    f"超出部分无法通过分页读取。"
+                )
+            if scan_notice:
+                header_lines.append(scan_notice)
+
+            if segment:
+                content = "\n".join(header_lines) + "\n--- 正文 ---\n" + segment
+            else:
+                content = "\n".join(header_lines)
 
             return {
                 "ok": True,
-               "type": "markdown",
+                "type": "markdown",
                 "display_name": self._display_name(entry, file_no),
                 "content": content,
-               "file_no": file_no,
+                "file_no": file_no,
                 "error": None,
+                "page": page_no,
+                "total_pages": total_pages,
+                "total_chars": total_chars,
+                "has_more": page_no < total_pages,
             }
-    
+        
         elif att_type == "image":
             path = entry.get("data")
 
@@ -503,7 +628,6 @@ class AttachmentCachePool:
         return None
 
     def _resolve_single_ref(self, ref):
-        """解析单个引用 → file_no"""
         kind = ref.get("kind")
         if kind == "file_no":
             fn = ref.get("num")
@@ -564,7 +688,6 @@ class AttachmentCachePool:
         return []
 
     def _match_by_filename(self, user_msg):
-        """文件名评分匹配"""
         if not user_msg or self.size == 0:
             return []
 
@@ -663,12 +786,10 @@ class AttachmentCachePool:
         self._entries.pop(key, None)
 
     def remove_by_file_no(self, file_no):
-        """按编号精确删除缓存池条目"""
         if file_no is not None:
             self._entries.pop(str(file_no), None)
         
     def tick(self):
-        """每轮对话结束后调用：递减所有条目的 ttl，移除过期条目。"""
         expired_keys = []
         for key, entry in self._entries.items():
             entry["ttl_turns"] -= 1

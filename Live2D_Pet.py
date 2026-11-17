@@ -80,7 +80,7 @@ HEAD_PARTS = {"head", "hair", "face", "eye", "brow", "mouth", "nose", "ear"}
 # ==================== 主应用程序类 ====================
 class Live2DPet:
     _json_cache = {}
-    EYE_RECOVER_SEC = 0.60
+    EYE_RECOVER_SEC = 0.70
 
     @classmethod
     def clear_json_cache(cls):
@@ -425,7 +425,7 @@ class Live2DPet:
 
     def _apply_character(self, ctx):
         from prompt import (set_model_character, clear_character_cache,
-                            _load_character_data, get_character_name)
+                            _load_character_data)
         from model_registry import resolve_character
 
         character_exists = False
@@ -810,7 +810,7 @@ class Live2DPet:
             self._set_auto_blink(False)
             
             # 从 context 获取时长
-            duration = lock_duration if lock_duration else (
+            duration = lock_duration if lock_duration is not None else (
                 ctx.get_motion_duration(actual_group, index) if ctx else 3.0
             )
             self.lock_end_time = time.time() + duration + 1.0
@@ -1171,18 +1171,6 @@ class Live2DPet:
                         grp = "pinch_in" if scroll_direction > 0 else "pinch_out"
                         self.start_motion(grp, dialog_msg=None, sound_group=grp)
 
-                if (
-                    not self.motion_lock
-                    and now - self.last_idle_time >= self.idle_interval
-                    and now - self.last_user_action_end_time >= self.idle_after_user_cooldown
-               ):
-                    ctx = self.current_context
-                    msgs = ctx.get_messages("idle") if ctx else []
-                    msg = random.choice(msgs) if msgs and random.random() < 0.3 else None
-                    if self.start_motion("idle", dialog_msg=msg):
-                        self.last_idle_time = now
-                        self.idle_interval = random.uniform(30, 60)
-
                 self.update_parameters_smooth()
                 self._update_eye_recover()
 
@@ -1243,17 +1231,6 @@ class Live2DPet:
                         glfw.make_context_current(self.window)
 
                 glfw.swap_buffers(self.window)
-
-                active = (
-                    self.motion_lock or
-                    self.interaction.is_dragging or
-                    (self.chat_window is not None and self.chat_window.active) or
-                    time.time() - self.last_interaction_time < self.idle_delay
-                )
-
-                desired_fps = self.active_fps if active else self.idle_fps
-                frame_time = 1.0 / desired_fps
-                elapsed = time.perf_counter() - frame_start
 
                 active = (
                     self.motion_lock or

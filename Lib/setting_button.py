@@ -172,23 +172,24 @@ def _draw_resize_unlock(d, cx, cy, s, color, active):
         )
 
 def _draw_model_switch(d, cx, cy, s, color, active):
-    lw = max(2, int(s * 0.055))
-    # 头部（圆）
-    head_r = s * 0.10
-    d.ellipse([cx - head_r, cy - s * 0.34, cx + head_r, cy - s * 0.34 + head_r * 2],
-              outline=color, width=lw)
-    # 身体（竖线）
-    d.line([(cx, cy - s * 0.14), (cx, cy + s * 0.12)], fill=color, width=lw)
-    # 手臂
-    d.line([(cx - s * 0.16, cy - s * 0.04), (cx + s * 0.16, cy - s * 0.04)],
-           fill=color, width=lw)
-    # 腿
-    d.line([(cx, cy + s * 0.12), (cx - s * 0.12, cy + s * 0.32)], fill=color, width=lw)
-    d.line([(cx, cy + s * 0.12), (cx + s * 0.12, cy + s * 0.32)], fill=color, width=lw)
-    # 右侧弧形箭头（表示切换）
-    d.arc([cx + s * 0.10, cy - s * 0.30, cx + s * 0.38, cy - s * 0.02],
-          start=-60, end=160, fill=color, width=lw)
+    t = s * 0.10                      # 轴厚
+    gap = s * 0.15                    # 上下轴中心偏移
+    x0, x1 = cx - s * 0.34, cx + s * 0.34
 
+    # ---- 上箭头（朝右）：横轴 + 右端上方实心三角 ----
+    ty0, ty1 = cy - gap - t * 0.5, cy - gap + t * 0.5
+    d.rectangle([x0, ty0, x1, ty1], fill=color)
+    hx = cx + s * 0.08
+    hy = ty0 - s * 0.18
+    d.polygon([(hx, hy), (hx, ty1), (x1, ty1)], fill=color)
+
+    # ---- 下箭头（朝左）：横轴 + 左端下方实心三角 ----
+    by0, by1 = cy + gap - t * 0.5, cy + gap + t * 0.5
+    d.rectangle([x0, by0, x1, by1], fill=color)
+    hx2 = cx - s * 0.08
+    hy2 = by1 + s * 0.18
+    d.polygon([(hx2, hy2), (hx2, by0), (x0, by0)], fill=color)
+    
 _ICON_DRAWERS = {
     "audio": _draw_speaker,
     "background": _draw_picture,
@@ -338,6 +339,7 @@ class SettingButtonGroup:
 
         # 聊天窗口大小解锁提示冷却
         self._last_resize_tip_time = 0.0
+        self._last_resize_dbl_tip_time = 0.0
 
         # 提示静默期
         self._tip_suppress_until = 0.0
@@ -382,6 +384,7 @@ class SettingButtonGroup:
             self._queue_pet_bubble("聊天窗口可以调整啦")
             self._tip_suppress_until = time.time() + 2.0
             self._schedule(2.0, self._show_resize_shift_tip)
+            self._schedule(4.0, self._show_resize_dbl_tip)
             
     def is_tip_active(self):
         return time.time() < self._tip_suppress_until
@@ -420,6 +423,14 @@ class SettingButtonGroup:
 
         self._last_resize_tip_time = now
         self._queue_pet_bubble("按Shift可以等比例调整哦")
+        self._tip_suppress_until = max(self._tip_suppress_until, now + 5.0)
+
+    def _show_resize_dbl_tip(self):
+        now = time.time()
+        if now - getattr(self, "_last_resize_dbl_tip_time", 0.0) < 10.0:
+            return
+        self._last_resize_dbl_tip_time = now
+        self._queue_pet_bubble("双击则恢复默认值呢")
         self._tip_suppress_until = max(self._tip_suppress_until, now + 5.0)
         
     def _schedule(self, delay, callback):
@@ -515,10 +526,6 @@ class SettingButtonGroup:
                 return b
         return None
 
-    def _hidden_by_chat(self):
-        chat = getattr(self.pet, "chat_window", None)
-        return chat is not None and getattr(chat, "active", False)
-
     def _cursor_rel(self):
         try:
             import glfw
@@ -596,11 +603,6 @@ class SettingButtonGroup:
         self._last_tick = now
 
         self._process_pending(raw_dt)
-
-        if self._hidden_by_chat():
-            self.hovered = False
-            self._group_alpha = 0.0
-            return
 
         self.set_scale(getattr(self.pet, "ui_scale", self.ui_scale))
 
@@ -694,8 +696,6 @@ class SettingButtonGroup:
 
     # ---------- 点击 ----------
     def handle_click(self, x, y, *args, **kwargs):
-        if self._hidden_by_chat():
-            return False
         if self._group_alpha <= 0.05 or not self._gl_ready:
             return False
         try:

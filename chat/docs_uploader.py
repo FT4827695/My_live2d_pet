@@ -11,6 +11,11 @@ from PIL import Image
 import fitz  # PyMuPDF
 from markitdown import MarkItDown
 
+def _get_doc_max_chars() -> int:
+    try:
+        return int(os.environ.get("XLLAMA_DOC_MAX_CHARS", "131072"))
+    except Exception:
+        return 131072
 
 class DocsUploader:
     DEFAULT_FILE_CACHE_TURNS = 30
@@ -266,25 +271,16 @@ class DocsUploader:
                 result = md.convert(file_path)
                 markdown_content = result.text_content or ""
 
-                n_ctx = int(os.environ.get("XLLAMA_CTX", 8192))
-                char_limit = int(n_ctx * 0.8 * 4)
-                MAX_CHARS = min(char_limit, 50000)
-
-                if len(markdown_content) > MAX_CHARS:
-                    markdown_content = markdown_content[:MAX_CHARS] + "\n\n[文档过长，截断]"
+                original_chars = len(markdown_content)
+                max_chars = _get_doc_max_chars()
+                upload_truncated = False
+                if max_chars > 0 and original_chars > max_chars:
+                    markdown_content = markdown_content[:max_chars]
+                    upload_truncated = True
 
                 pdf_scan_info = None
-
                 if ext == '.pdf':
                     pdf_scan_info = self._detect_pdf_scan_pages(file_path)
-
-                    if pdf_scan_info and pdf_scan_info.get("has_scanned_pages"):
-                        scan_notice = self._build_pdf_scan_notice(pdf_scan_info)
-                        if scan_notice:
-                            if not markdown_content.strip():
-                                markdown_content = scan_notice
-                            else:
-                                markdown_content += "\n\n" + scan_notice
 
                 return {
                     'type': 'markdown',
@@ -296,8 +292,10 @@ class DocsUploader:
                     'pdf_mode': None,
                     'temp_dir': None,
                     'pdf_scan_info': pdf_scan_info,
+                    'doc_original_chars': original_chars,
+                    'doc_upload_truncated': upload_truncated,
                 }
-
+            
             except Exception as e:
                 if ext == '.pdf':
                     try:
@@ -339,26 +337,93 @@ class DocsUploader:
         except Exception:
             return 0
 
+    @staticmethod
+    def _normalize_columns(df):
+        new_cols = []
+        seen = {}
+        for i, c in enumerate(df.columns):
+            if pd.isna(c):
+                name = f"Unnamed: {i}"
+            else:
+                name = str(c).replace('\n', ' ').replace('\r', ' ').strip()
+                if not name:
+                    name = f"Unnamed: {i}"
+
+            if name in seen:
+                seen[name] += 1
+                name = f"{name}.{seen[name]}"
+            else:
+                seen[name] = 0
+            new_cols.append(name)
+
+        df.columns = new_cols
+        return df
+
+    @staticmethod
+    def _build_storage_hint(file_path, header_rows=None):
+        ext = os.path.splitext(str(file_path))[1].lower()
+        if ext not in (".xlsx", ".xlsm"):
+            return ""
+        try:
+            from file_exporter import inspect_xlsx_storage
+        except Exception:
+            return ""
+        try:
+            info = inspect_xlsx_storage(file_path, header_rows=header_rows)
+        except Exception:
+            return ""
+        if not info or not info.get("checked"):
+            return ""
+
+        bad = int(info.get("text_numeric_cells") or 0)
+        if bad <= 0:
+            return (
+                "\n\n【存储格式提示】已按单元格类型检查："
+                "未发现文本型数字，数值均以数字格式存储。"
+            )
+
+        cols = info.get("columns") or []
+        col_text = "、".join(str(c) for c in cols[:8])
+        if len(cols) > 8:
+            col_text += f" 等{len(cols)}列"
+        scope = "（抽样检查）" if info.get("truncated") else ""
+        return (
+            f"\n\n【存储格式提示{scope}】\n"
+            f"本文件有 {bad} 个单元格以文本形式存储数字"
+            + (f"，涉及列：{col_text}" if col_text else "")
+            + "。\n"
+            "上方表格内容已把这些值解析为数字供你计算，"
+            "但原文件的存储格式确实是文本"
+            "（Excel 会提示「数字为文本模式」，通常左对齐、无法直接求和）。\n"
+            "判断格式问题请以本提示为准，"
+            "不要依据内存中的 dtype 断言「文件没问题」。"
+        )
+    
     def _preprocess_excel(self, file_path):
         try:
             all_text = []
             dataframes = []
+            header_rows = {} 
             with pd.ExcelFile(file_path) as xls:
                 sheet_names = xls.sheet_names[:3]
                 for sheet_name in sheet_names:
                     header_row = self._find_header_row(file_path, sheet_name)
+                    header_rows[sheet_name] = header_row 
                     df = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
-                    df.columns = [str(c).replace('\n', ' ').strip() for c in df.columns if pd.notna(c)]
+                    df = self._normalize_columns(df)
                     df = df.dropna(axis=1, how='all')
                     for col in df.columns:
-                        if df[col].dtype == 'object':
-                            numeric_col = pd.to_numeric(df[col], errors='coerce')
-                            if numeric_col.notna().sum() > df[col].notna().sum() * 0.8:
-                                df[col] = numeric_col
+                        dt = df[col].dtype
+                        if not (dt == object or pd.api.types.is_string_dtype(dt)):
+                            continue
+                        numeric_col = pd.to_numeric(df[col], errors='coerce')
+                        if numeric_col.notna().sum() > df[col].notna().sum() * 0.8:
+                            df[col] = numeric_col                                
                     csv_str = df.to_csv(index=False)
                     all_text.append(f"【Sheet: {sheet_name}】\n{csv_str}")
                     dataframes.append(df)
             combined_text = "\n\n".join(all_text)
+            combined_text += self._build_storage_hint(file_path, header_rows)
             combined_df = pd.concat(dataframes, ignore_index=True) if dataframes else None
             return combined_text, combined_df
         except Exception as e:

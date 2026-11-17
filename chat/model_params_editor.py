@@ -2,6 +2,7 @@
 import os
 import json
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from prompt import get_character_name
 
 try:
     import glfw
@@ -27,6 +28,7 @@ except Exception:
 
 DEFAULT_TITLE = "模型高级设置"
 
+BATCH_SIZE_OPTIONS_FULL = [256, 512, 1024, 2048]
 
 # (key, label, group, kind, spec)
 # group: "load" / "sampling"
@@ -35,10 +37,12 @@ FIELD_DEFS: List[Tuple[str, str, str, str, Dict[str, Any]]] = [
     # ---- 加载时 ----
     ("ctx", "CTX", "load", "int",
      {"min": 2048, "max": 1048576, "default": 8192}),
+    ("batch_size", "Batch Size", "load", "enum",
+     {"options": BATCH_SIZE_OPTIONS_FULL, "default": 512}),
     ("kv_cache", "KV Cache", "load", "enum",
      {"options": KV_CACHE_OPTIONS_FULL, "default": "q8_0"}),
     ("vram_extra_mb", "显存调整", "load", "int",
-     {"min": -2048, "max": 4096, "default": 0, "suffix": " MB"}),
+     {"min": 0, "max": 4096, "default": 0, "suffix": " MB"}),
     ("mtp", "MTP", "load", "enum",
      {"options": MTP_OPTIONS_FULL, "default": 0}),
     # ---- 采样 ----
@@ -60,7 +64,6 @@ GROUP_LABELS = {
     "load": "加载参数",
     "sampling": "采样参数",
 }
-
 
 class ModelParamsEditor:
 
@@ -315,7 +318,7 @@ class ModelParamsEditor:
 
         if self.add_message is not None:
             try:
-                self.add_message("shizuku", "高级设置已保存，重新加载模型后生效。")
+                self.add_message(get_character_name(), "高级设置已保存，重新加载模型后生效。")
             except Exception:
                 pass
 

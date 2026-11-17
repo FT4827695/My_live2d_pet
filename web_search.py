@@ -1147,8 +1147,8 @@ class WebSearchEngine:
             new_info["fetch_info"] = fetch_info
             return new_info, unwrapped
         if reason == "fail":
-        return info, url
-    
+            return info, url
+        
     # ---------- 搜索 ----------
     def search(self, query, max_results=None, aborted=None):
         settings = InternetSettings.get_instance()

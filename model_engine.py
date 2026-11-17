@@ -14,8 +14,9 @@ from response_stats import (
     inject_stream_options,
     capture_usage_from_chunk,
     probe_kv_cache_usage,
+    get_n_ctx,
+    get_max_gen_tokens,
 )
-
 
 def _get_temperature_from_env() -> float:
     try:
@@ -199,9 +200,9 @@ class _RealXllamaEngine:
 
     # ----------------------------------------------------------
     def start_server(self, use_gpu=False, use_mmproj=True):
-        n_ctx = int(os.environ.get("XLLAMA_CTX", 8192))
-        self.max_gen_tokens = max(256, int(n_ctx * 0.4))
-
+        n_ctx = get_n_ctx()
+        self.max_gen_tokens = get_max_gen_tokens(n_ctx)
+        
         if self.model_path is None or not os.path.exists(self.model_path):
             return False
 
@@ -219,19 +220,34 @@ class _RealXllamaEngine:
 
         try:
             params = self._build_params(xlc, use_gpu=use_gpu)
-            self.server = xlc.Server(params)
+        
+            margins = None
+            extra_mb = 0
+            try:
+                extra_mb = int(os.environ.get("XLLAMA_VRAM_EXTRA_MB", "0"))
+            except Exception:
+                extra_mb = 0
 
+            if extra_mb > 0:
+                base = extra_mb * 1024 * 1024
+                step = 256 * 1024 * 1024
+                margins = (base, base + step)
+
+            if margins is not None:
+                self.server = xlc.Server(params, fit_retry_margins_bytes=margins)
+                print(f"[智能加载] OOM 重试余量序列: {[m // (1024 ** 2) for m in margins]} MB")
+            else:
+                self.server = xlc.Server(params)
+                
             if params.n_gpu_layers == 0:
                 mode_desc = "CPU"
             elif params.n_gpu_layers == -1:
-                mode_desc = "GPU (全量)"
+                mode_desc = "GPU (Auto-fit)"
             else:
                 mode_desc = f"GPU (智能 {params.n_gpu_layers} 层)"
-
+                
             mm_desc = "多模态" if self.mmproj_path else "纯文本"
-
-            print(f"[Worker] 模型加载成功！({mode_desc} / {mm_desc}, "
-                  f"CTX={params.n_ctx})")
+            print(f"[Worker] 模型加载成功！({mode_desc} / {mm_desc}, CTX={params.n_ctx})")
             return True
 
         except Exception as e:
@@ -241,20 +257,78 @@ class _RealXllamaEngine:
             return False
 
     # ----------------------------------------------------------
+    @staticmethod
+    def _pick_gpu_device(gpu_devices):
+        idx = os.environ.get("XLLAMA_GPU_INDEX", "").strip()
+        name = os.environ.get("XLLAMA_GPU_NAME", "").strip().lower()
+
+        if idx.isdigit():
+            i = int(idx)
+            if 0 <= i < len(gpu_devices):
+                return i, gpu_devices[i]
+
+        discrete_keys = (
+            "nvidia", "geforce", "rtx", "gtx", "quadro",
+            "radeon rx", "arc"
+        )
+        integrated_keys = (
+            "intel", "iris", "uhd",
+            "amd radeon graphics"
+        )
+
+        def score(i, d):
+            dev_type = d.get("type")
+            if hasattr(dev_type, "value"):
+                if dev_type.value == 0:  # 0 代表 CPU
+                    return -999999, 0, -i
+            elif dev_type == 0:
+                return -999999, 0, -i
+
+            n = str(d.get("description", "")).lower()
+            if not n:
+                n = str(d.get("name", "")).lower()
+
+            s = 0
+
+            # 精确名字匹配
+            if name and name in n:
+                s += 10000
+
+            # 优先独显
+            if any(k in n for k in discrete_keys):
+                s += 1000
+
+            # 降低核显优先级
+            if any(k in n for k in integrated_keys):
+                s -= 500
+
+            mem = d.get("memory_free") or d.get("memory_total") or 0
+            try:
+                mem = int(mem)
+            except Exception:
+                mem = 0
+
+            return s, mem, -i
+
+        best_i = max(range(len(gpu_devices)), key=lambda i: score(i, gpu_devices[i]))
+        return best_i, gpu_devices[best_i]
+    
     def _build_params(self, xlc, use_gpu):
         media_dir = self.base_dir
         if not os.path.exists(media_dir):
             os.makedirs(media_dir, exist_ok=True)
 
         params = xlc.CommonParams()
+
         params.verbosity = 0
+            
         params.model.path = self.model_path
 
         if hasattr(params, "use_jinja"):
             params.use_jinja = True
             print("[优化] 已开启 Jinja 模板引擎")
 
-        params.n_ctx = int(os.environ.get("XLLAMA_CTX", 8192))
+        params.n_ctx = get_n_ctx()
         params.n_batch = int(os.environ.get("XLLAMA_BATCH", 512))
 
         if hasattr(params, "cache_prompt"):
@@ -345,90 +419,39 @@ class _RealXllamaEngine:
                     pass
 
         if use_gpu:
-            # ============ 智能分层逻辑 ============
-            try:
-                from xllamacpp import estimate_gpu_layers, get_device_info
+            # ============  xllamacpp (v2026.11+) Auto-fit  ============
+            get_device_info = getattr(xlc, "get_device_info", None)
+            gpu_devices = []
 
+            if callable(get_device_info):
                 try:
                     gpu_devices = get_device_info()
                 except Exception:
                     gpu_devices = []
 
-                if not isinstance(gpu_devices, list) or not gpu_devices:
-                    gpu_devices = [{"name": "Vulkan0"}]
+            if not isinstance(gpu_devices, list) or not gpu_devices:
+                gpu_devices = [{"name": "Vulkan0"}]
 
-                free_mb, source = get_available_vram_mb()
-                mem_free_bytes = int(free_mb * 1024 * 1024)
+            chosen_index, chosen = self._pick_gpu_device(gpu_devices)
+            dev_desc = chosen.get('description') or chosen.get('name', 'Unknown')
+            print(f"[GPU设备] 选择设备: #{chosen_index} {dev_desc}")
+            
+            for field in ("main_gpu", "device_index", "gpu_index"):
+                if hasattr(params, field):
+                    try:
+                        setattr(params, field, chosen_index)
+                        print(f"[GPU设备] 已设置 {field}={chosen_index}")
+                    except Exception:
+                        pass
 
-                reserved_bytes = 256 * 1024 * 1024
-
-                try:
-                    extra_mb = int(os.environ.get("XLLAMA_VRAM_EXTRA_MB", "0"))
-                except Exception:
-                    extra_mb = 0
-                extra_bytes = extra_mb * 1024 * 1024
-
-                actual_free = max(
-                    0, mem_free_bytes - reserved_bytes + extra_bytes
-                )
-
-                device_name = gpu_devices[0].get("name", "Vulkan0")
-                devices = [{
-                    "name": device_name,
-                    "memory_free": actual_free,
-                    "memory_min": 256 * 1024 * 1024,
-                }]
-
-                projectors = [self.mmproj_path] if self.mmproj_path else []
-
-                print(f"[智能加载] 显存来源: {source} | "
-                      f"可用: {free_mb:.0f} MB，正在计算最优层数...")
-
-                _KV_ESTIMATE_MAP = {
-                    1: "f16",
-                    8: "q8_0",
-                    2: "q4_0",
-                    20: "q4_0",
-                }
-
-                kv_estimate_type = _KV_ESTIMATE_MAP.get(kv_int_k, "f16")
-                if kv_cache_str == "q8_iq4":
-                    kv_estimate_type = "q4_0"
-
-                est_layers = 0
-                est_vram = 0
-
-                est = estimate_gpu_layers(
-                    devices, self.model_path,
-                    projectors, context_length=params.n_ctx,
-                    batch_size=params.n_batch, num_parallel=n_parallel,
-                    kv_cache_type=kv_estimate_type,
-                )
-
-                est_layers = est.layers
-                est_vram = est.vram_size
-
-                if est_layers > 0:
-                    params.n_gpu_layers = est_layers
-                    vram_gb = est_vram / (1024 ** 3)
-                else:
-                    print("[智能加载] 层数为 0，显存严重不足，"
-                          "自动降级为纯 CPU。")
-                    params.n_gpu_layers = 0
-
-            except ImportError:
-                print("[智能加载] estimate_gpu_layers 不可用，"
-                      "回退到全量 GPU (-1)")
-                params.n_gpu_layers = -1
-            except Exception as e:
-                print(f"[智能加载] 估算异常 ({e})，"
-                      f"安全兜底：回退到全量 GPU (-1)")
-                params.n_gpu_layers = -1
+            params.n_gpu_layers = -1
+            print("[智能加载] 已启用底层 Auto-fit (n_gpu_layers = -1)")
+            # ====================================================================                
             # ======================================
         else:
             params.n_gpu_layers = 0
             print("[加载] 纯 CPU 模式 (n_gpu_layers = 0)")
-
+            
         # ===== 视觉模块联动 =====
         if self.mmproj_path:
             params.mmproj.path = self.mmproj_path
@@ -1024,6 +1047,8 @@ class XllamaEngine:
         if not self._is_ready:
             return None
 
+        timeout_s = int(os.environ.get("XLLAMA_GEN_TIMEOUT", "600"))
+
         with self._req_lock:
             self._req_counter += 1
             req_id = self._req_counter
@@ -1032,7 +1057,7 @@ class XllamaEngine:
 
             while True:
                 try:
-                    item = self.res_queue.get(timeout=120)
+                    item = self.res_queue.get(timeout=timeout_s)
 
                     if item is None:
                         continue
@@ -1046,6 +1071,7 @@ class XllamaEngine:
                         return result
 
                 except queue.Empty:
+                    print(f"[XllamaEngine] generate 超时（{timeout_s}s），req_id={req_id}")
                     return None
 
     def generate_stream(self, messages, image_paths=None):
@@ -1060,10 +1086,13 @@ class XllamaEngine:
 
         self.cmd_queue.put(('generate_stream', req_id, messages, image_paths))
 
+        timeout_s = int(os.environ.get("XLLAMA_GEN_TIMEOUT", "600"))
+
         while True:
             try:
-                item = self.res_queue.get(timeout=120)
+                item = self.res_queue.get(timeout=timeout_s)
             except queue.Empty:
+                print(f"[XllamaEngine] generate_stream 超时（{timeout_s}s），req_id={req_id}")
                 break
 
             if item is None:

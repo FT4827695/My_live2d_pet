@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 
 from services import CodeExecutor
 
@@ -21,6 +22,9 @@ def get_execute_code_tool_schema():
                 "表格文件名和列名仅用于定位与写代码，禁止据此推断数据内容。"
                 "所有数值、统计、筛选、排名、汇总结论必须来自代码输出。"
                 "结果赋值给 result 变量或用 print() 输出。"
+                "如果用户需要保存/导出结果，必须将 DataFrame 赋值给 result 变量，"
+                "不要仅用 print() 输出。"
+                "仅在用户只需要查看而不需要保存时才使用 print()。"
             ),
             "parameters": {
                 "type": "object",
@@ -72,6 +76,7 @@ def get_read_file_tool_schema():
                 "读取成功后，才会披露真实文件名。"
                 "获取文件内容的唯一可靠途径，回答追问时可再次调用此工具。"
                 "表格可通过此工具查看结构，但表格名和列名仅用于定位，不能代替代码计算。"
+                "文档较长时会分页返回，返回信息会说明总页数与续读方式。"
             ),
             "parameters": {
                 "type": "object",
@@ -80,6 +85,14 @@ def get_read_file_tool_schema():
                         "type": "integer",
                         "minimum": 1,
                         "description": "要读取的文件编号，必须是正整数。"
+                    },
+                    "page": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "可选，文档页码，从1开始。不传时：能一次读完则返回全文，"
+                            "否则返回第1页。续读时按返回信息里给出的页码传入。"
+                        )
                     }
                 },
                 "required": ["file_no"],
@@ -87,7 +100,6 @@ def get_read_file_tool_schema():
             }
         }
     }
-
 
 def get_view_image_tool_schema():
     return {
@@ -124,10 +136,11 @@ def get_export_result_tool_schema():
             "name": "export_result",
             "strict": True,
             "description": (
-                "将最近一次分析或计算得到的结果保存为本地文件（保存到桌面）。"
+                "将分析或计算得到的结果保存为本地文件（保存到桌面）。"
                 "当用户明确要求保存、导出、存成文件时才调用此工具。"
-                "必须通过调用此工具来完成用户的保存请求。"
-                "没有工具调用，文件就没有保存。"
+                "必须通过调用此工具来完成用户的保存请求，没有工具调用文件就没有保存。"
+                "工具会返回导出内容概览（行列数/列名）与存储层校验结果，"
+                "请据此确认导出的是否为目标结果；若不是，带 result_id 重新调用。"
             ),
             "parameters": {
                 "type": "object",
@@ -136,6 +149,11 @@ def get_export_result_tool_schema():
                         "type": "string",
                         "enum": ["auto", "txt", "csv", "json", "excel"],
                         "description": "保存格式。auto 表示根据结果类型自动选择。"
+                    },
+                    "result_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "可选。指定要导出的结果编号，编号见导出工具返回的可导出清单。"
                     }
                 },
                 "required": [],
@@ -267,6 +285,36 @@ class ToolLoopDriver:
 
         return file_no, None
 
+    @staticmethod
+    def _normalize_page(value):
+        if isinstance(value, bool):
+            return None, "参数 'page' 必须是正整数，不能是布尔值。"
+        if isinstance(value, int):
+            page = value
+        elif isinstance(value, float):
+            if value.is_integer():
+                page = int(value)
+            else:
+                return None, f"参数 'page' 必须是正整数，当前值为 {value}。"
+        elif isinstance(value, str):
+            s = value.strip()
+            if s.isdigit():
+                page = int(s)
+            else:
+                try:
+                    f = float(s)
+                except (ValueError, TypeError):
+                    return None, f"参数 'page' 必须是正整数，当前值为 '{value}'。"
+                if f.is_integer():
+                    page = int(f)
+                else:
+                    return None, f"参数 'page' 必须是正整数，当前值为 '{value}'。"
+        else:
+            return None, f"参数 'page' 必须是正整数，当前类型为 {type(value).__name__}。"
+        if page < 1:
+            return None, f"参数 'page' 必须大于等于 1，当前值为 {page}。"
+        return page, None
+    
     def _validate_tool_args(self, func_name, args_str):
         try:
             args = json.loads(args_str) if args_str else {}
@@ -305,8 +353,15 @@ class ToolLoopDriver:
             file_no, err = ToolLoopDriver._normalize_file_no(file_no)
             if err is not None:
                 return None, err
-            return {"file_no": file_no}, None
-
+            normalized = {"file_no": file_no}
+            page = args.get("page")
+            if page is not None:
+                page, page_err = ToolLoopDriver._normalize_page(page)
+                if page_err is not None:
+                    return None, page_err
+                normalized["page"] = page
+            return normalized, None
+        
         elif func_name == "view_cached_image":
             file_no = args.get("file_no")
             if file_no is None:
@@ -317,21 +372,24 @@ class ToolLoopDriver:
             return {"file_no": file_no}, None
 
         elif func_name == "export_result":
+            out = {}
             fmt = args.get("format")
-
             if fmt is not None:
                 if not isinstance(fmt, str):
                     return None, f"参数 'format' 必须是字符串，当前类型为 {type(fmt).__name__}。"
-
                 fmt = fmt.strip().lower()
-
                 if fmt not in ("auto", "txt", "csv", "json", "excel"):
                     return None, f"参数 'format' 的值 '{fmt}' 不合法。只允许: auto, txt, csv, json, excel。"
-
-                return {"format": fmt}, None
-
-            return {}, None
-
+                out["format"] = fmt
+            rid = args.get("result_id")
+            if rid is not None:
+                if isinstance(rid, str) and rid.strip().isdigit():
+                    rid = int(rid.strip())
+                if isinstance(rid, bool) or not isinstance(rid, int) or rid < 1:
+                    return None, "参数 'result_id' 必须是正整数。"
+                out["result_id"] = rid
+            return out, None
+        
         elif func_name == "web_search":
             query = args.get("query")
             if not isinstance(query, str) or not query.strip():
@@ -392,7 +450,10 @@ class ToolLoopDriver:
 
         searched_queries = set()
 
-        active_image_paths = []
+        if message_processor is not None and hasattr(message_processor, "active_image_paths"):
+            active_image_paths = message_processor.active_image_paths
+        else:
+            active_image_paths = []
 
         if df is None and dfs is None and cache_pool:
             excel_dfs = []
@@ -429,20 +490,36 @@ class ToolLoopDriver:
 
         for loop_idx in range(max_loops):
             if _aborted():
-                return "（已停止）", last_raw_result, last_output, used_fc
+                return "（已停止）", last_raw_result, last_output, used_fc, tool_trace
 
+            is_last_loop = (loop_idx >= max_loops - 1) and loop_idx > 0
+            if is_last_loop and loop_idx > 0:
+                current_messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统提示] 本轮工具预算已用尽，不能再调用工具。"
+                        "请基于已经获得的信息直接给出结论；"
+                        "如果信息不足，说明已完成到哪一步、还缺什么，并询问用户是否继续。"
+                    ),
+                })
+            _t_model = time.perf_counter()
             resp = engine.generate(
                 current_messages,
                 image_paths=active_image_paths,
-                tools=tools,
+                tools=None if is_last_loop else tools,
                 return_raw_dict=True
             )
+            if stats is not None:
+                try:
+                    stats.add_model_time(time.perf_counter() - _t_model)
+                except Exception:
+                    pass
 
             if _aborted():
-                return "（已停止）", last_raw_result, last_output, used_fc
+                return "（已停止）", last_raw_result, last_output, used_fc, tool_trace
 
             if resp is None:
-                return None, None, "", used_fc
+                return None, None, "", used_fc, tool_trace
 
             if stats is not None:
                 stats.record_raw_dict(resp, messages=current_messages)
@@ -490,9 +567,10 @@ class ToolLoopDriver:
                 assistant_msg["tool_calls"] = tool_calls
                 current_messages.append(assistant_msg)
 
+                _t_tool = time.perf_counter()
                 for tc in tool_calls:
                     if _aborted():
-                        return "（已停止）", last_raw_result, last_output, used_fc
+                        return "（已停止）", last_raw_result, last_output, used_fc, tool_trace
                     
                     func_name = tc.get("function", {}).get("name")
                     args_str = tc.get("function", {}).get("arguments", "{}")
@@ -551,10 +629,8 @@ class ToolLoopDriver:
 
                         elif func_name == "read_cached_file":
                             file_no = args["file_no"]
-
                             if cache_pool and file_no is not None:
-                                res = cache_pool.retrieve(file_no)
-
+                                res = cache_pool.retrieve(file_no, page=args.get("page"))
                                 if res.get("ok"):
                                     if res.get("type") == "image":
                                         structured_result["error_type"] = "wrong_tool_for_image"
@@ -569,12 +645,14 @@ class ToolLoopDriver:
                                 else:
                                     structured_result["error_type"] = "file_retrieve_failed"
                                     structured_result["error"] = res.get("error", "未知读取错误")
-                                    structured_result["next_action"] = "请检查 file_no 是否正确，或调用 list_cached_files 确认文件编号。"
+                                    structured_result["next_action"] = res.get("next_action") or (
+                                        "请检查 file_no 是否正确，或调用 list_cached_files 确认文件编号。"
+                                    )
                             else:
                                 structured_result["error_type"] = "invalid_environment"
                                 structured_result["error"] = "缓存池不可用或未提供有效的文件编号。"
                                 structured_result["next_action"] = "请确认当前环境是否有文件，并提供正确的 file_no。"
-
+                            
                         elif func_name == "view_cached_image":
                             view_res = self._request_view_cached_image(
                                 engine=engine,
@@ -584,12 +662,15 @@ class ToolLoopDriver:
                             )
                             structured_result.update(view_res)
 
+                            if structured_result.get("ok") and message_processor is not None:
+                                message_processor._turns_since_image_access = 0
+
                             if not structured_result.get("ok"):
                                 structured_result.setdefault(
                                     "next_action",
                                     "请检查 file_no 是否对应图片文件，或确认当前视觉模块是否可用。"
                                 )
-
+                                
                         elif func_name == "export_result":
                             exp_res = self._run_export(args, message_processor)
                             structured_result.update(exp_res)
@@ -643,17 +724,33 @@ class ToolLoopDriver:
                             "result_head": tool_result[:300],
                         })
 
+                    if stats is not None:
+                        try:
+                            from response_stats import (
+                                note_tool_result_tokens, estimate_text_tokens
+                            )
+                            note_tool_result_tokens(estimate_text_tokens(tool_result))
+                        except Exception:
+                            pass
+                    
                     current_messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
                         "content": tool_result
                     })
 
+                if stats is not None:
+                    try:
+                        stats.add_tool_time(time.perf_counter() - _t_tool)
+                    except Exception:
+                        pass
+                    
                 continue
 
             return content, last_raw_result, last_output, used_fc, tool_trace
 
-        return "（这...做不来了）", last_raw_result, last_output, used_fc, tool_trace
+        print(f"[ToolLoop] 轮数耗尽仍未产出最终回复（max_loops={max_loops}）")
+        return "（处理轮数达到上限）", last_raw_result, last_output, used_fc, tool_trace
     
     def _request_view_cached_image(self, engine, cache_pool, file_no, active_image_paths):
         if cache_pool is None:
@@ -748,16 +845,65 @@ class ToolLoopDriver:
 
         fmt = str(args.get("format") or "auto").strip().lower()
         requested = None if fmt in ("", "auto") else fmt
+        need_table = fmt in ("excel", "csv")
 
-        payload = getattr(message_processor, "last_exportable", None) if message_processor else None
+        candidates = getattr(message_processor, "_export_candidates", None) or []
+        rid = args.get("result_id")
+
+        def _listing():
+            if not candidates:
+                return "（空）"
+            return "；".join(
+                f"#{c['id']} [{c.get('kind')}] {c.get('summary', '')}"
+                for c in candidates
+            )
+
+        if rid is not None:
+            payload = next((c for c in candidates if c.get("id") == rid), None)
+            if payload is None:
+                return {
+                    "ok": False, "error_type": "unknown_result_id",
+                    "error": f"找不到编号 {rid} 的结果。当前可导出：{_listing()}",
+                    "next_action": "改用正确的 result_id，或省略该参数导出默认结果。",
+                }
+            if need_table and not payload.get("is_table"):
+                return {
+                    "ok": False,
+                    "error_type": "not_table_payload",
+                    "error": (
+                        f"#{rid} 不是表格结果（kind={payload.get('kind')}），"
+                        f"无法以 {fmt} 导出。"
+                    ),
+                    "next_action": (
+                        "改用 format='txt'/'json' 导出文本；"
+                        "或先执行 execute_python_code 得到一个 DataFrame/Series 赋值给 result，"
+                        "再调用 export_result。"
+                    ),
+                }
+        else:
+            payload = next((c for c in reversed(candidates) if c.get("is_table")), None)
+            if payload is None and need_table:
+                return {
+                    "ok": False,
+                    "error_type": "no_table_payload",
+                    "error": (
+                        f"当前没有可导出的表格结果（请求格式 {fmt}）。"
+                        f"现有候选：{_listing()}"
+                    ),
+                    "next_action": (
+                        "请先执行 execute_python_code 并把目标数据赋值给 result "
+                        "（DataFrame 或 Series），再调用 export_result；"
+                        "或改用 format='txt'/'json' 导出文本。"
+                    ),
+                }
+            if payload is None:
+                payload = candidates[-1] if candidates else getattr(
+                    message_processor, "last_exportable", None)
 
         if not payload:
-            return {
-                "ok": False,
-                "error_type": "no_payload",
-                "error": "当前还没有可以保存的结果，请先进行分析或计算。"
-            }
-
+            return {"ok": False, "error_type": "no_payload",
+                    "error": "当前还没有可以保存的结果，请先进行分析或计算。"}
+        
         try:
             res = file_exporter.save_exportable(payload, requested)
         except Exception as e:
@@ -770,19 +916,41 @@ class ToolLoopDriver:
                     self.pet.queue_bubble("表格保存好啦" if kind == "table" else "文档保存好啦")
             except Exception:
                 pass
-
-            return {
-                "ok": True,
-                "data": f"已成功保存到桌面：{os.path.basename(res.get('path', ''))}"
-            }
+            lines = [f"已成功保存到桌面：{os.path.basename(res.get('path', ''))}"]
+            lines.append(f"导出内容：#{payload.get('id', '?')} {payload.get('summary', '')}")
+            cur = getattr(message_processor, "_turn_index", None)
+            pt = payload.get("turn")
+            if cur is not None and pt is not None and pt < cur:
+                lines.append(f"注意：该结果产生于第 {pt} 轮，不是本轮的新结果。")
+            if len(candidates) > 1:
+                lines.append("可导出结果：" + "；".join(
+                    f"#{c['id']}{'(本次)' if c is payload else ''} {c.get('summary', '')}"
+                    for c in candidates))
+                lines.append("若导出的不是目标结果，请带 result_id 重新调用。")
+            if res.get("note"):
+                lines.append(f"说明：{res['note']}")
+            return {"ok": True, "data": "\n".join(lines)}
 
         err = res.get("error_code", "unknown")
-
         if err == "desktop_unavailable":
             return {"ok": False, "error_type": "path_error", "error": "找不到桌面路径。"}
-
+        if err == "not_tabular":
+            saved = res.get("path")
+            saved_name = os.path.basename(saved) if saved else "(未知)"
+            return {
+                "ok": False,
+                "error_type": "not_tabular",
+                "error": (
+                    f"结果无法解析为表格，已按文本保存为 {saved_name}，"
+                    f"格式不是请求的 {fmt}。"
+                ),
+                "next_action": (
+                    "如果确实需要 excel/csv，请先得到 DataFrame/Series 再导出；"
+                    "若文本格式可接受，请改用 format='txt'。"
+                ),
+            }
         return {"ok": False, "error_type": "save_failed", "error": f"保存失败（{err}）。"}
-
+    
     def _run_web_search(self, args, aborted):
         try:
             from internet_settings import InternetSettings

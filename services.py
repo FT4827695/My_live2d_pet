@@ -14,9 +14,17 @@ import numpy as np
 from typing import Union, Any
 from rag_utils import AttachmentCachePool
 import time
+import traceback
+from _sandbox_builtins import get_safe_builtins
+import sandbox_codec
 
 from prompt import get_character_name
-from response_stats import ResponseStats, estimate_text_tokens
+from response_stats import (
+    ResponseStats,
+    estimate_text_tokens,
+    get_n_ctx,
+    get_max_prompt_tokens,
+)
 
 ASSISTANT_NAME = get_character_name()
 ASSISTANT_PREFIX = ASSISTANT_NAME + ": "
@@ -169,7 +177,7 @@ class TextUtils:
         elif sender == "stats":
             prefix = ""
         else:
-            if sender and sender != "shizuku":
+            if sender and sender != get_character_name():
                 prefix = f"{sender}: "
             else:
                 prefix = f"{get_character_name()}: "
@@ -220,22 +228,6 @@ _SANDBOX_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sand
 class CodeExecutor:
 
     @staticmethod
-    def _convert_numpy_types(obj: Any) -> Any:
-        if isinstance(obj, (np.float64, np.float32)):
-            return float(obj)
-
-        if isinstance(obj, (np.int64, np.int32)):
-            return int(obj)
-
-        if isinstance(obj, dict):
-            return {k: CodeExecutor._convert_numpy_types(v) for k, v in obj.items()}
-
-        if isinstance(obj, (list, tuple)):
-            return [CodeExecutor._convert_numpy_types(item) for item in obj]
-
-        return obj
-
-    @staticmethod
     def _sanitize_json_value(value):
         if value is None or isinstance(value, (str, bool, int)):
             return value
@@ -280,12 +272,72 @@ class CodeExecutor:
     def _df_to_json_payload(d: pd.DataFrame):
         if d is None:
             return None
-
         d = d.copy(deep=True)
         d.columns = [str(c) for c in d.columns]
+        enc = sandbox_codec.encode_table(d)
+        if enc is not None:
+            return enc
+        # 极端结构（如 MultiIndex 列）回退旧格式
+        payload = d.to_dict(orient="split")
+        payload["dtypes"] = {str(c): str(t) for c, t in d.dtypes.items()}
+        return CodeExecutor._sanitize_json_value(payload)
+    
+    # ===== 沙箱共享核心 =====
+    @staticmethod
+    def _safe_builtins():
+        return get_safe_builtins()
 
-        data = d.to_dict(orient="split")
-        return CodeExecutor._sanitize_json_value(data)
+    @staticmethod
+    def _assign_last_expr(code_str):
+        try:
+            tree = ast.parse(code_str)
+            if not tree.body or not isinstance(tree.body[-1], ast.Expr):
+                return code_str
+            last = tree.body[-1].value
+            if (isinstance(last, ast.Call)
+                    and isinstance(last.func, ast.Name)
+                    and last.func.id == "print"):
+                return code_str
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = (node.targets if isinstance(node, ast.Assign)
+                               else [node.target])
+                    for t in targets:
+                        if isinstance(t, ast.Name) and t.id == "result":
+                            return code_str
+                        if isinstance(t, (ast.Tuple, ast.List)):
+                            for e in t.elts:
+                                if isinstance(e, ast.Name) and e.id == "result":
+                                    return code_str
+            tree.body[-1] = ast.Assign(
+                targets=[ast.Name(id="result", ctx=ast.Store())], value=last
+            )
+            ast.fix_missing_locations(tree)
+            return ast.unparse(tree)
+        except Exception:
+            return code_str
+        
+    @staticmethod
+    def _finalize_exec_result(success, output, result):
+        if not success:
+            return False, output, None
+        if isinstance(result, np.generic):
+            result = result.item()
+        output = (output or "").strip()
+        if output:
+            return True, output, result
+        if result is not None:
+            if isinstance(result, pd.DataFrame):
+                display = result.to_csv(index=False)
+            elif isinstance(result, pd.Series):
+                display = result.to_string(index=True)
+            else:
+                display = str(result)
+            return True, display, result
+        return False, (
+            "代码执行成功但没有产生任何输出。"
+            "请在代码末尾用 `result = ...` 赋值，或用 `print(...)` 输出结果。"
+        ), None
     
     @staticmethod
     def execute_code(code_str: str, df: pd.DataFrame = None, dfs: list = None):
@@ -302,53 +354,30 @@ class CodeExecutor:
         import itertools as _itertools
         import statistics as _statistics
 
-        # 构造受限命名空间（只暴露白名单内容）
         namespace = {
-            "__builtins__": {
-                # 只允许安全的内置函数
-                "print": print, "len": len, "range": range, "enumerate": enumerate,
-                "zip": zip, "map": map, "filter": filter, "sorted": sorted,
-                "min": min, "max": max, "sum": sum, "abs": abs, "round": round,
-                "int": int, "float": float, "str": str, "bool": bool, "list": list,
-                "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
-                "isinstance": isinstance, "type": type, "hasattr": hasattr,
-                "getattr": getattr, "setattr": setattr, "repr": repr,
-                "True": True, "False": False, "None": None,
-                "ValueError": ValueError, "TypeError": TypeError,
-                "KeyError": KeyError, "IndexError": IndexError,
-                "Exception": Exception,
-            },
-            # 白名单库
-            "pd": pd,
-            "np": np,
-            "math": _math,
-            "re": _re,
-            "json": _json,
-            "datetime": _datetime,
-            "collections": _collections,
-            "itertools": _itertools,
-            "statistics": _statistics,
-            # 数据
-            "df": df,
-            "dfs": dfs,
+            "__builtins__": CodeExecutor._safe_builtins(),
+            "pd": pd, "np": np,
+            "math": _math, "re": _re, "json": _json,
+            "datetime": _datetime, "collections": _collections,
+            "itertools": _itertools, "statistics": _statistics,
+            "df": df, "dfs": dfs, "result": None,
         }
+        if dfs:
+            for i, d in enumerate(dfs):
+                namespace[f"df{i + 1}"] = d
 
-        # 捕获 stdout
-        import io, contextlib
+        code_str = CodeExecutor._assign_last_expr(code_str)
+
         stdout_capture = io.StringIO()
-        result = None
-
         try:
             with contextlib.redirect_stdout(stdout_capture):
                 exec(code_str, namespace)
-            result = namespace.get("result", None)
-        except Exception as e:
+        except Exception:
             output = stdout_capture.getvalue()
-            return False, f"代码执行出错: {e}\n{output}", None
-
-        output = stdout_capture.getvalue()
-        return True, output, result
-
+            tb = traceback.format_exc()
+            return False, f"代码执行出错:\n{tb}\n--- stdout ---\n{output}", None
+        return True, stdout_capture.getvalue(), namespace.get("result", None)
+    
     @staticmethod
     def execute_code_with_raw(code_str, df=None, dfs=None):
         # ===== 1. 数据预处理 =====
@@ -367,7 +396,7 @@ class CodeExecutor:
         code_str = re.sub(rf'^\s*from\s+{allowed_imports}\s+import\b.*$', '', code_str, flags=re.MULTILINE)
 
         # ===== 3. regex 第一道过滤 =====
-        if re.search(r'read_excel|read_csv|open\(|load\s*\(|from\s+file', code_str):
+        if re.search(r'\bopen\s*\(|\bread_excel\s*\(|\bread_csv\s*\(', code_str):
             return False, "代码中禁止读取外部文件，直接使用已有的 df 或 dfs 变量。", None
 
         # ===== 4. AST 预检 =====
@@ -382,8 +411,10 @@ class CodeExecutor:
 
         # ===== 5. 根据环境选择执行方式 =====
         if getattr(sys, 'frozen', False):
-            return CodeExecutor._execute_in_sandbox_namespace(code_str, df, dfs)
-
+            return CodeExecutor._finalize_exec_result(
+                *CodeExecutor._execute_in_sandbox_namespace(code_str, df, dfs)
+            )
+        
         payload = {
             "code": code_str,
             "df": CodeExecutor._df_to_json_payload(df),
@@ -430,22 +461,11 @@ class CodeExecutor:
             return False, f"子进程返回非 JSON 内容: {stdout[:2000]}", None
         if not res.get("success"):
             return False, res.get("output", "子进程执行失败"), None
-
-        result = res.get("result")
-        output = res.get("output", "")
-        if output:
-            return True, output, result
-        if result is not None:
-            if isinstance(result, pd.DataFrame):
-                display = result.to_csv(index=False)
-            elif isinstance(result, pd.Series):
-                display = result.to_string(index=True)
-            else:
-                display = str(result)
-            return True, display, result
-        return False, "代码执行成功但没有输出。务必在代码末尾使用 `result = ...` 或 `print(...)` 来输出结果。", None
-
-
+        return CodeExecutor._finalize_exec_result(
+            True, res.get("output", ""),
+            sandbox_codec.decode_result(res.get("result")),
+        )
+    
 # ================== 4. 消息处理中枢 =================
 class MessageProcessor:
 
@@ -454,7 +474,12 @@ class MessageProcessor:
         self.uploader = getattr(pet_instance, "docs_uploader", None)
         self.cache_pool = AttachmentCachePool()
         self.last_exportable = None
+        self._export_candidates = []
+        self._export_seq = 0
+        self._turn_index = 0
         self.last_stats = None
+        self.active_image_paths = []
+        self._turns_since_image_access = 0
 
         self.emoji_mapping = {
             "😊": "(^_^)", "😄": "(^▽^)", "😃": "(✧▽✧)", "😀": "(◠‿◠)", "😁": "(￣▽￣)", "😆": "(≧∇≦)", "✨": "☆*",
@@ -589,6 +614,8 @@ class MessageProcessor:
                 "exact_label": att.get("exact_label", ""),
                 "source_format": att.get("source_format", ""),
                 "pdf_scan_info": scan_info,
+                "doc_original_chars": att.get("doc_original_chars"),
+                "doc_upload_truncated": bool(att.get("doc_upload_truncated", False)),                
             }
 
             if normalized_type == "markdown" and scan_info.get("has_scanned_pages"):
@@ -614,6 +641,70 @@ class MessageProcessor:
         if hasattr(self, 'cache_pool'):
             self.cache_pool.clear()
 
+    @staticmethod
+    def _looks_like_table(kind, data):
+        if kind == "table":
+            return True
+        if isinstance(data, dict):
+            return any(isinstance(v, (pd.DataFrame, pd.Series, dict, list, tuple))
+                       for v in data.values())
+        if isinstance(data, (list, tuple)):
+            return bool(data) and any(
+                isinstance(x, (dict, list, tuple, pd.DataFrame, pd.Series)) for x in data)
+        return False
+
+    @staticmethod
+    def _summarize_exportable(kind, data):
+        try:
+            if isinstance(data, pd.DataFrame):
+                cols = "、".join(str(c) for c in list(data.columns)[:8])
+                return f"表格 {data.shape[0]}行×{data.shape[1]}列；列名：{cols}"
+            if isinstance(data, pd.Series):
+                return f"序列 {len(data)}项；名称：{data.name}"
+            if isinstance(data, dict):
+                parts = []
+                for k, v in list(data.items())[:5]:
+                    if isinstance(v, pd.DataFrame):
+                        parts.append(f"{k}({v.shape[0]}×{v.shape[1]})")
+                    elif isinstance(v, pd.Series):
+                        parts.append(f"{k}(序列{len(v)})")
+                    else:
+                        parts.append(f"{k}({type(v).__name__})")
+                return "多表/字典：" + "、".join(parts)
+            if isinstance(data, (list, tuple)):
+                head = data[0] if data else None
+                if isinstance(head, dict):
+                    return f"记录集 {len(data)}条；字段：{'、'.join(str(k) for k in list(head)[:8])}"
+                return f"列表 {len(data)}项"
+            s = str(data)
+            return f"文本 {len(s)}字符；开头：{s[:60]!r}"
+        except Exception:
+            return str(kind)
+
+    def _register_exportable(self, kind, data, base):
+        entry = None
+        if self._export_candidates:
+            last = self._export_candidates[-1]
+            if last["data"] is data and last["kind"] == kind:
+                entry = last
+        if entry is None:
+            self._export_seq += 1
+            entry = {
+                "id": self._export_seq,
+                "turn": self._turn_index,
+                "kind": kind,
+                "data": data,
+                "is_table": self._looks_like_table(kind, data),
+                "summary": self._summarize_exportable(kind, data),
+            }
+            self._export_candidates.append(entry)
+            if len(self._export_candidates) > 5:
+                self._export_candidates.pop(0)
+        entry["filename_base"] = base
+        entry["source_label"] = base
+        self.last_exportable = entry
+        return entry
+    
     # ---------- Agent 核心 ----------
     def _record_tool_result(self, raw_result, output):
         if raw_result is None and not output:
@@ -629,11 +720,7 @@ class MessageProcessor:
         else:
             kind, data = "text", output
 
-        self.last_exportable = {
-            "kind": kind, "data": data,
-            "filename_base": "计算结果", "source_label": "计算结果",
-        }
-
+        self._register_exportable(kind, data, "计算结果")
 
     def _safe_append_history_agent(self, u_msg, a_msg, generation_id, tool_trace=None):
         if generation_id is not None and not self.pet.is_generation_current(generation_id):
@@ -656,6 +743,13 @@ class MessageProcessor:
 
             return "（模型未加载）", None
 
+        self._turns_since_image_access += 1
+        self._turn_index += 1
+        if self._turns_since_image_access > 6 and self.active_image_paths:
+            print(f"[MessageProcessor] 清理过期活动图片：{len(self.active_image_paths)} 张")
+            self.active_image_paths.clear()
+            self._turns_since_image_access = 0
+            
         # ===== 提取请求中的图片路径 =====
         image_paths = []
 
@@ -807,17 +901,17 @@ class MessageProcessor:
                 var_desc_lines = [item[1] for item in raw_desc_items]
 
                 fact_statement = (
-                    "[系统规则]：\n"
-                    "- 文件编号代表上传的顺序。\n"
+                    "[环境与规则]：\n"
+                    "- 文件编号 = 上传顺序。文件正文只能通过工具获取。\n"
                     "- 标记为 [未读取] 的文件，上下文中不存在该文件的任何实质内容。\n"
-                    "- 标记为 [未注入] 的图片，当前视觉输入中没有图片，禁止声称已看到图片；"
-                    "必须调用 view_cached_image。调用成功后，下一轮才能基于图片回答。\n"
+                    "- 标记为 [未注入] 的图片，图片不在视觉输入里。view_cached_image(file_no=N) 使它进入下一轮；"
+                    "调用成功后，下一轮才能基于图片回答。\n"
                     "- 标记为 [已挂载] 的表格数据已在 df/dfs 中，必须调用 execute_python_code 进行计算。\n"
                     "- 标记为 [已读取] 只表示该文件曾经被读取过，不代表当前上下文仍保留原文。"
-                    "若用户追问 [已读取] 文件的细节，如果不确定，必须再次调用 read_cached_file。\n"
+                    "若用户追问 [已读取] 文件的细节，可调用 read_cached_file(file_no=N)，允许重复调用；返回会告知总页数和续读方式。\n"
                     "- 标记为 [含扫描页] 的文档，只能通过视觉模块提取内容。\n"
-                    "- 未读取文档的真实文件名不可见，禁止根据用户描述猜测文档内容。\n"
-                    "- 跳过 [未读取] 或 [未注入] 文件直接回答，视为违规。\n"
+                    "- 未读取文档的真实文件名不可见，禁止猜测文档内容。\n"
+                    "- 取证不足可以直接说明。\n"
                 )
                 index_hint = (
                     fact_statement
@@ -900,11 +994,17 @@ class MessageProcessor:
             if web_search_enabled:
                 tools.append(get_web_search_tool_schema(web_search_source_names))
                 tools.append(get_read_web_article_tool_schema())
+
+            try:
+                tool_max_loops = max(1, int(os.environ.get("XLLAMA_TOOL_MAX_LOOPS", "12")))
+            except Exception:
+                tool_max_loops = 12
+            
             driver = ToolLoopDriver(self.pet)
 
             final_reply, raw_result, output, used_fc, tool_trace = driver.run(
                 messages, tools, cache_pool=self.cache_pool,
-                max_loops=8, generation_id=generation_id,
+                max_loops=tool_max_loops, generation_id=generation_id,
                 message_processor=self, stats=stats, image_paths=[],
             )
         else:
@@ -951,6 +1051,7 @@ class MessageProcessor:
                     )},
                 ]
                 from tools import ToolLoopDriver
+                
                 driver = ToolLoopDriver(self.pet)
                 retry_reply, raw_result, output, retry_used_fc, retry_trace = driver.run(
                     reflect_messages, tools,
@@ -1004,16 +1105,10 @@ class MessageProcessor:
             else:
                 kind, data = "text", output
 
-            self.last_exportable = {
-                "kind": kind, "data": data,
-                "filename_base": base, "source_label": base,
-            }
-
+            self._register_exportable(kind, data, base)
+                        
         elif not self.last_exportable and final_reply:
-            self.last_exportable = {
-                "kind": "text", "data": final_reply,
-                "filename_base": "对话记录", "source_label": "对话记录",
-            }
+            self._register_exportable("text", final_reply, "对话记录")
 
         if stream_callback and final_reply:
             chunk_size = 8
@@ -1093,9 +1188,7 @@ class MessageProcessor:
         time_context = f"<sys_time>{time.strftime('%Y-%m-%d %H:%M', current_time)} {weekdays[current_time.tm_wday]}</sys_time>"
         user_content = f"{time_context}\n{user_msg}"
 
-        n_ctx = int(os.environ.get("XLLAMA_CTX", 8192))
-        max_gen_tokens = max(256, int(n_ctx * 0.4))
-        max_prompt_tokens = n_ctx - max_gen_tokens
+        max_prompt_tokens = get_max_prompt_tokens(get_n_ctx())
 
         return self.pet.conversation_store.build_api_messages(
             system=system,
@@ -1131,3 +1224,5 @@ class MessageProcessor:
 
     def clear_cache(self):
         self.last_exportable = None
+        self._export_candidates = []
+        self._export_seq = 0

@@ -13,39 +13,29 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-_ALLOWED_MODULES = {
-    "pandas", "numpy", "math", "re", "json",
-    "datetime", "collections", "itertools", "statistics",
-}
+from _sandbox_builtins import get_safe_builtins
 
-
-def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name.split(".")[0] not in _ALLOWED_MODULES:
-        raise ImportError(f"禁止导入非白名单模块: {name}")
-    return __import__(name, globals, locals, fromlist, level)
-
-
-_SAFE_BUILTINS = {
-    "len": len, "range": range, "print": print,
-    "str": str, "int": int, "float": float,
-    "list": list, "dict": dict, "tuple": tuple,
-    "set": set, "sum": sum, "max": max, "min": min,
-    "abs": abs, "round": round, "enumerate": enumerate,
-    "zip": zip, "map": map, "filter": filter,
-    "__import__": _safe_import,
-}
-
+_SAFE_BUILTINS = get_safe_builtins()
 
 def _restore_df(payload_df):
     if payload_df is None:
         return None
     import pandas as pd
-    return pd.DataFrame(
+    import sandbox_codec
+    df = sandbox_codec.decode_table(payload_df)
+    if df is not None:
+        return df
+    df = pd.DataFrame(
         data=payload_df.get("data"),
         index=payload_df.get("index"),
         columns=payload_df.get("columns"),
     )
-
+    for col, dt in (payload_df.get("dtypes") or {}).items():
+        try:
+            df[col] = df[col].astype(dt)
+        except Exception:
+            pass
+    return df
 
 def main():
     payload = json.loads(sys.stdin.read())
@@ -74,15 +64,33 @@ def main():
     try:
         tree = ast.parse(code)
         if tree.body and isinstance(tree.body[-1], ast.Expr):
-            tree.body[-1] = ast.Assign(
-                targets=[ast.Name(id="result", ctx=ast.Store())],
-                value=tree.body[-1].value,
-            )
-            ast.fix_missing_locations(tree)
-            code = ast.unparse(tree)
+            last = tree.body[-1].value
+            skip = (isinstance(last, ast.Call)
+                    and isinstance(last.func, ast.Name)
+                    and last.func.id == "print")
+            if not skip:
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        targets = (node.targets if isinstance(node, ast.Assign)
+                                   else [node.target])
+                        for t in targets:
+                            if isinstance(t, ast.Name) and t.id == "result":
+                                skip = True
+                            if isinstance(t, (ast.Tuple, ast.List)):
+                                for e in t.elts:
+                                    if isinstance(e, ast.Name) and e.id == "result":
+                                        skip = True
+                    if skip:
+                        break
+            if not skip:
+                tree.body[-1] = ast.Assign(
+                    targets=[ast.Name(id="result", ctx=ast.Store())], value=last
+                )
+                ast.fix_missing_locations(tree)
+                code = ast.unparse(tree)
     except Exception:
         pass
-
+    
     output = ""
     try:
         f = io.StringIO()
@@ -90,23 +98,13 @@ def main():
             exec(code, namespace)
         output = f.getvalue().strip()
         result = namespace.get("result")
-
-        if result is not None:
-            try:
-                json.dumps(result)
-            except (TypeError, ValueError):
-                if hasattr(result, "to_csv"):
-                    result = result.to_csv(index=False)
-                elif hasattr(result, "to_string"):
-                    result = result.to_string(index=True)
-                else:
-                    result = str(result)
-
+        import sandbox_codec
+        result = sandbox_codec.encode_result(result)
         print(json.dumps({
             "success": True,
             "output": output,
             "result": result,
-        }, ensure_ascii=False))
+        }, ensure_ascii=False))        
     except Exception:
         import traceback
         print(json.dumps({

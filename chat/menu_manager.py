@@ -31,8 +31,8 @@ TEMPERATURE_OPTIONS = [
     1.0,
 ]
 VRAM_EXTRA_OPTIONS = [
-    -256,
     0,
+    256,
     512,
     768,
 ]
