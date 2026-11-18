@@ -412,9 +412,18 @@ class SettingButtonGroup:
             self._queue_pet_bubble("没有别的了~")
             return
 
-        target = random.choice(candidates)
-        pet.switch_model(target)
+        # 素描过渡进行中：禁止重入
+        if getattr(pet, "switch_phase", "idle") != "idle":
+            self._queue_pet_bubble("正在换装中…")
+            return
         
+        target = random.choice(candidates)
+        if hasattr(pet, "request_switch"):
+            if not pet.request_switch(target):
+                self._queue_pet_bubble("哎？换不过去…")
+        else:
+            pet.switch_model(target)
+         
     def _show_resize_shift_tip(self):
         now = time.time()
 

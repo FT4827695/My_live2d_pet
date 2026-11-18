@@ -992,7 +992,7 @@ class ToolLoopDriver:
     def _run_read_web_article(self, args):
         try:
             from internet_settings import InternetSettings
-            from web_search import run_read_article
+            from web_search import run_read_article, truncate_display_url
         except Exception as e:
             return {
                 "ok": False,
@@ -1023,10 +1023,13 @@ class ToolLoopDriver:
                 "error": res.get("error", "正文读取失败"),
                 "next_action": res.get("next_action", "请依据搜索摘要作答，不要重复重试。")
             }
+            
+        display_url = truncate_display_url(res.get('url', ''), 80)
+        
         data = (
             f"标题：{res.get('title', '')}\n"
             f"来源：{res.get('source_name', '')}\n"
-            f"链接：{res.get('url', '')}\n"
+            f"链接：{display_url}\n"
             f"正文：\n{res.get('text', '')}"
         )
         return {"ok": True, "data": data}

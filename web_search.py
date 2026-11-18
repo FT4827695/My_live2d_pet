@@ -66,6 +66,20 @@ def _truncate(text, max_chars):
         return text
     return text[:max_chars] + "\n…[内容过长已截断]"
 
+def truncate_display_url(url, max_len=80):
+    if not url or len(url) <= max_len:
+        return url
+    cut_idx = max_len
+    while cut_idx > 0 and url[cut_idx - 1] == '%':
+        cut_idx -= 1
+    if cut_idx < len(url):
+        if cut_idx > 0 and url[cut_idx - 1] == '%':
+            cut_idx -= 1
+        elif cut_idx > 1 and url[cut_idx - 2] == '%':
+            cut_idx -= 2
+    if cut_idx <= 0:
+        return url[:max_len] + "..."
+    return url[:cut_idx] + "..."
 
 def _normalize_query(query):
     q = re.sub(r"\s+", " ", str(query or "").strip().lower())
@@ -1791,7 +1805,6 @@ class WebSearchEngine:
         return False, "URL 不在白名单内"
 
 # ==================== 结果格式化 ====================
-
 def format_search_results(results, failed_sources=None):
     if not results:
         return "未获得搜索结果。"
@@ -1803,13 +1816,16 @@ def format_search_results(results, failed_sources=None):
         snippet = (r.get("snippet") or "").strip()
         if len(snippet) > per_limit:
             snippet = snippet[:per_limit] + "…"
-        if re.search(r"20[2-9]\d\s*年|\d{1,2}\s*月", snippet):
+        if re.search(r"20[2-9]\d\s年|\d{1,2}\s月", snippet):
             snippet = f"{snippet}（含时间信息）"
+            
+        display_url = truncate_display_url(r.get('url', ''), 80)
+        
         lines.append(
             f"[{i}] 来源: {r.get('source_name', '')} | "
             f"标题: {r.get('title', '')} | ID: {r.get('ref_id', '')}\n"
             f"摘要: {snippet}\n"
-            f"链接: {r.get('url', '')}"
+            f"链接: {display_url}"
         )
     if failed_sources:
         lines.append(f"[注意] 以下来源本次未能返回结果：{'；'.join(failed_sources)}")
@@ -1819,7 +1835,6 @@ def format_search_results(results, failed_sources=None):
         "优先使用具体数字、时间、限定条件；不要复述全部结果。"
     )
     return "\n".join(lines)
-
 
 # ==================== 单例入口 ====================
 

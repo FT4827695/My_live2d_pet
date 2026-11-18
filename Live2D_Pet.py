@@ -34,6 +34,13 @@ import live2d.v2 as live2d
 from model_registry import ModelRegistry, ModelContext
 from settings_store import get_settings
 
+from sketch_transition import (
+    SketchTransition,
+    OUT_DRAIN, OUT_ERASE,
+    IN_LINE, IN_FILL_DELAY, IN_FILL, IN_TOTAL,
+    LINE_FADE_T0, LINE_FADE_T1,IN_SCALE_START, ease_out_back, 
+)
+
 from dataclasses import dataclass
 from typing import Optional
 import win32gui, win32con
@@ -177,6 +184,12 @@ class Live2DPet:
             x_offset=self.bubble_x_offset,
             y_offset=self.bubble_y_offset
         )
+
+        # ===== 素描式切换过渡 =====
+        self.sketch = SketchTransition()
+        self.switch_phase = "idle"     # idle / out / in
+        self.switch_t0 = 0.0
+        self.switch_target = None
         
     # ==================== 三档分辨率计算 ====================
     def _compute_display_metrics(self):
@@ -375,6 +388,81 @@ class Live2DPet:
         print(f"[模型切换] <<< 完成")
         return True
 
+    # ==================== 素描切换过渡 ====================
+    def is_switching(self):
+        return self.switch_phase != "idle"
+
+    def request_switch(self, target_model_id):
+        if self.is_switching() or self.model is None:
+            return False
+        ctx = self.registry.get(target_model_id)
+        if ctx is None:
+            return False
+        if self.current_context and ctx.model_id == self.current_context.model_id:
+            return False
+        self.switch_target = target_model_id
+        self.switch_phase = "out"
+        self.switch_t0 = time.time()
+        return True
+
+    @staticmethod
+    def _ease(t):
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _draw_model_with_transition(self, now):
+        if self.model is None:
+            return
+        if self.switch_phase == "idle":
+            self.model.Update()
+            self.model.Draw()
+            return
+        if not self.sketch.ensure(self._cached_win_w, self._cached_win_h):
+            self.switch_phase = "idle"
+            self.switch_target = None
+            self.model.Update()
+            self.model.Draw()
+            return
+        if self.switch_phase == "out":
+            t = now - self.switch_t0
+            if t < OUT_DRAIN:
+                fillp = 1.0 - self._ease(t / OUT_DRAIN)
+                linep, linea = 1.0, 1.0
+            elif t < OUT_DRAIN + OUT_ERASE:
+                fillp = 0.0
+                linep = 1.0 - self._ease((t - OUT_DRAIN) / OUT_ERASE)
+                linea = 1.0
+            else:
+                # 全空帧执行同步加载
+                ok = self.switch_model(self.switch_target)
+                self.switch_target = None
+                if not ok or self.model is None:
+                    self.switch_phase = "idle"
+                    return
+                self.switch_phase = "in"
+                self.switch_t0 = now
+                return
+            self._sketch_frame(fillp, linep, linea, now)
+        elif self.switch_phase == "in":
+            t = now - self.switch_t0
+            if t >= IN_TOTAL:
+                self.switch_phase = "idle"
+                self.model.Update()
+                self.model.Draw()
+                return
+            linep = self._ease(t / IN_LINE)
+            fillp = self._ease((t - IN_FILL_DELAY) / IN_FILL)
+            linea = 1.0 - self._ease((t - LINE_FADE_T0) / (LINE_FADE_T1 - LINE_FADE_T0))
+            scale = IN_SCALE_START + (1.0 - IN_SCALE_START) * ease_out_back(t / IN_TOTAL)
+            self._sketch_frame(fillp, linep, linea, now, scale)
+
+    def _sketch_frame(self, fillp, linep, linea, now, scale=1.0):
+        self.sketch.begin_capture()
+        self.model.Update()
+        self.model.Draw()
+        self.sketch.end_capture()
+        self.sketch.draw_composite(fillp, linep, linea, now, scale)
+        
     def _unload_current_model(self):
         # 1. 删除旧模型的预乘纹理
         if self.model is not None:
@@ -559,6 +647,12 @@ class Live2DPet:
             print(f"[退出] 释放 Live2D 模型失败: {e}")
 
         try:
+            if getattr(self, "sketch", None) is not None:
+                self.sketch.destroy()
+        except Exception as e:
+            print(f"[退出] 清理素描过渡失败: {e}")
+            
+        try:
             live2d.dispose()
         except Exception as e:
             print(f"[退出] live2d.dispose 失败: {e}")
@@ -622,6 +716,7 @@ class Live2DPet:
     # ==================== 点击动作封装 ====================
     def play_head_click_motion(self):
         if self.model is None: return False
+        if self.is_switching(): return False
         ctx = self.current_context
         group = ctx.get_semantic_group("tap_head") if ctx else "flick_head"
         
@@ -649,6 +744,7 @@ class Live2DPet:
     
     def play_body_click_motion(self):
         if self.model is None: return False
+        if self.is_switching(): return False        
         ctx = self.current_context
         group = ctx.get_semantic_group("tap_body") if ctx else "tap_body"
         
@@ -671,7 +767,7 @@ class Live2DPet:
 
     # ==================== 细粒度命中分类 ====================
     def classify_hit(self, x, y):
-        if self.model is None:
+        if self.model is None or self.is_switching():
             return None
         ctx = self.current_context
         try:
@@ -721,6 +817,7 @@ class Live2DPet:
     def play_part_motion(self, part):
         if self.model is None:
             return False
+        if self.is_switching(): return False
         ctx = self.current_context
         picked = ctx.pick_part_motion(part) if ctx else None
         if picked is None:
@@ -1121,6 +1218,7 @@ class Live2DPet:
                 # 自动表情切换（空闲时）
                 if (
                     not self.motion_lock
+                    and not self.is_switching()
                     and now - self.last_idle_time >= self.idle_interval
                     and now - self.last_user_action_end_time >= self.idle_after_user_cooldown
                 ):
@@ -1167,14 +1265,15 @@ class Live2DPet:
 
                 scroll_direction = self.interaction.consume_pending_scroll_action()
                 if scroll_direction is not None:
-                    if not self.motion_lock:
+                    if not self.motion_lock and not self.is_switching():
                         grp = "pinch_in" if scroll_direction > 0 else "pinch_out"
                         self.start_motion(grp, dialog_msg=None, sound_group=grp)
 
                 self.update_parameters_smooth()
                 self._update_eye_recover()
 
-                if (not self.motion_lock and 
+                if (not self.motion_lock and
+                    not self.is_switching() and
                     self._eye_recover is None and 
                     now > self.next_expression_time):
                     
@@ -1201,10 +1300,9 @@ class Live2DPet:
                 )
                 self.background.tick_and_draw(now, self._cached_win_w, self._cached_win_h, chat_active)
 
-                # 绘制主窗口模型
-                self.model.Update()
-                self.model.Draw()
-
+                # 绘制主窗口模型（含素描切换过渡）
+                self._draw_model_with_transition(now)
+            
                 gl.glUseProgram(0)
                 gl.glEnable(gl.GL_BLEND)
                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
