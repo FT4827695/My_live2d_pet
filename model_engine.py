@@ -8,6 +8,7 @@ import glob
 from PIL import Image
 import multiprocessing as mp
 import queue
+import time
 
 from capabilities import match_capabilities
 from response_stats import (
@@ -156,6 +157,7 @@ class _RealXllamaEngine:
         self.models_dir = os.path.join(self.base_dir, "models")
         self.model_path = None
         self.mmproj_path = None
+        self.mtp_draft_path = None
         self.server = None
         self.lock = threading.Lock()
 
@@ -166,6 +168,8 @@ class _RealXllamaEngine:
 
     # ----------------------------------------------------------
     def _auto_detect_models(self):
+        self.mtp_draft_path = None
+
         if not os.path.isdir(self.models_dir):
             os.makedirs(self.models_dir, exist_ok=True)
             return
@@ -175,29 +179,39 @@ class _RealXllamaEngine:
             return
 
         mmproj_candidates = []
+        mtp_candidates = []
         main_candidates = []
 
         for f in gguf_files:
-            if "mmproj" in os.path.basename(f).lower():
+            fname = os.path.basename(f).lower()
+            if "mmproj" in fname:
                 mmproj_candidates.append(f)
+            elif fname.startswith("mtp-"):
+                mtp_candidates.append(f)
             else:
                 main_candidates.append(f)
 
         if main_candidates:
             self.model_path = max(main_candidates, key=os.path.getsize)
         else:
-            remaining = [f for f in gguf_files if f not in mmproj_candidates]
+            remaining = [f for f in gguf_files
+                         if f not in mmproj_candidates
+                         and f not in mtp_candidates]
             if remaining:
                 self.model_path = max(remaining, key=os.path.getsize)
 
         if mmproj_candidates:
             self.mmproj_path = max(mmproj_candidates, key=os.path.getsize)
 
+        if mtp_candidates:
+            self.mtp_draft_path = max(mtp_candidates, key=os.path.getsize)
+            print(f"[Worker] MTP 草稿模型：{os.path.basename(self.mtp_draft_path)}")
+
         if self.model_path:
             print(f"[Worker] 主模型：{os.path.basename(self.model_path)}")
         if self.mmproj_path:
             print(f"[Worker] 视觉模块：{os.path.basename(self.mmproj_path)}")
-
+            
     # ----------------------------------------------------------
     def start_server(self, use_gpu=False, use_mmproj=True):
         n_ctx = get_n_ctx()
@@ -461,49 +475,75 @@ class _RealXllamaEngine:
         params.media_path = os.path.join(media_dir, '')
         params.n_predict = -1
 
+        # ===== 投机解码 / MTP =====
+        _STATE_SPEC_MODES = ("mtp", "eagle3", "dflash", "dspark")
+        draft_path = self.mtp_draft_path if spec_mode in _STATE_SPEC_MODES else None
+
         if spec_mode != "off" and hasattr(params, "speculative"):
-            spec = params.speculative
-
             try:
-                n_draft = int(os.environ.get("XLLAMA_SPEC_DRAFT", "1"))
+                spec = params.speculative
+                n_draft = max(1, int(os.environ.get("XLLAMA_SPEC_DRAFT", "2")))
 
-                if spec_mode == "mtp":
-                    if hasattr(xlc, "common_speculative_type"):
-                        mtp_type = getattr(
-                            xlc.common_speculative_type,
-                            "COMMON_SPECULATIVE_TYPE_DRAFT_MTP",
-                            3
-                        )
-                        spec.types = [mtp_type]
+                _SPEC_ENUM = {
+                    "mtp":    "COMMON_SPECULATIVE_TYPE_DRAFT_MTP",
+                    "eagle3": "COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3",
+                    "dflash": "COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH",
+                    "dspark": "COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK",
+                    "ngram":  "COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE",
+                }
+                enum_name = _SPEC_ENUM.get(spec_mode)
+                enum_cls = getattr(xlc, "common_speculative_type", None)
+                spec_type = getattr(enum_cls, enum_name, None) if enum_name else None
+                if spec_type is None:
+                    raise RuntimeError(
+                        f"不支持的 XLLAMA_SPEC_MODE='{spec_mode}'，"
+                        f"可用: off / {' / '.join(_SPEC_ENUM)}"
+                    )
 
-                    if hasattr(spec, "draft"):
-                        spec.draft.n_max = n_draft
-                        spec.draft.n_min = 0
+                spec.types = [spec_type]
 
-                    draft_kv = os.environ.get("XLLAMA_SPEC_DRAFT_KV", "q8_0").strip().lower()
+                if not hasattr(spec, "draft"):
+                    raise RuntimeError("当前 xllamacpp 缺少 spec.draft 字段")
+                d = spec.draft
+                if draft_path:
+                    if hasattr(d, "mparams"):
+                        d.mparams.path = draft_path
+                    elif hasattr(spec, "mparams_dft"):
+                        spec.mparams_dft.path = draft_path
+                    else:
+                        raise RuntimeError("无法找到路径字段")
+                d.n_max = n_draft
+                d.n_min = 0
+                if hasattr(d, "n_gpu_layers"):
+                    d.n_gpu_layers = params.n_gpu_layers
 
-                    if draft_kv in _VULKAN_UNSUPPORTED_KV:
-                        print(f"[投机解码] draft KV {draft_kv} 在 Vulkan 后端"
-                              f"不支持 SET_ROWS，回退 q8_0")
-                        draft_kv = "q8_0"
+                draft_kv = os.environ.get("XLLAMA_SPEC_DRAFT_KV", "").strip().lower()
+                if not draft_kv:
+                    draft_kv = kv_cache_str
+                if draft_kv in _VULKAN_UNSUPPORTED_KV:
+                    draft_kv = "q8_0"
+                dkv = _GGML_TYPE_MAP.get(draft_kv)
+                if dkv is None:
+                    print(f"[投机解码] 未知 Draft KV '{draft_kv}'，回退 q8_0")
+                    draft_kv, dkv = "q8_0", 8
+                d.cache_type_k = dkv
+                d.cache_type_v = dkv
 
-                    draft_kv_int = _GGML_TYPE_MAP.get(draft_kv)
-
-                    if draft_kv_int is not None and hasattr(spec.draft, "cache_type_k"):
-                        try:
-                            spec.draft.cache_type_k = draft_kv_int
-                            spec.draft.cache_type_v = draft_kv_int
-                            print(f"[投机解码] Draft KV Cache 压缩格式: {draft_kv}")
-                        except Exception as e:
-                            print(f"[投机解码] 设置 draft KV 类型失败: {e}")
-
-                    print(f"[投机解码] 已开启内置 MTP 模式 (draft={n_draft})")
-
+                rb = params.speculative
+                rb_types = list(rb.types)
+                if not rb_types or int(rb_types[0]) != int(spec_type):
+                    raise RuntimeError("spec.types 写入未生效")
+                rb_path = getattr(rb.draft.mparams, "path", "") if hasattr(rb.draft, "mparams") else ""
+                if draft_path and not rb_path:
+                    raise RuntimeError("草稿路径写入未生效")
+                print(f"[投机解码] types={spec_mode}({int(spec_type)}), "
+                      f"n_max={rb.draft.n_max}, KV={draft_kv}, "
+                      f"权重={os.path.basename(rb_path) if rb_path else '主模型内置'}")
             except Exception as e:
                 print(f"[投机解码] 配置失败: {e}")
                 import traceback
                 traceback.print_exc()
-
+                
         # ==========================================================
         # 采样参数
         # ==========================================================
@@ -1009,8 +1049,23 @@ class XllamaEngine:
         self.process.start()
 
         try:
-            item = self.res_queue.get(timeout=300)
-
+            deadline = time.time() + 300
+            item = None
+            while True:
+                try:
+                    item = self.res_queue.get(timeout=1)
+                    break
+                except queue.Empty:
+                    if self.process is not None and not self.process.is_alive():
+                        print(f"[XllamaEngine] 子进程异常退出 "
+                              f"exitcode={self.process.exitcode}"
+                              f"（3 / 负值 / 0xC0000409 多为底层 GGML_ASSERT abort）")
+                        self._is_ready = False
+                        self.stop_server()
+                        return False
+                    if time.time() >= deadline:
+                        raise queue.Empty
+                    
             if isinstance(item, tuple) and len(item) >= 2:
                 data = item[1]
 
