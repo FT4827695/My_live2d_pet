@@ -482,7 +482,7 @@ class _RealXllamaEngine:
         if spec_mode != "off" and hasattr(params, "speculative"):
             try:
                 spec = params.speculative
-                n_draft = max(1, int(os.environ.get("XLLAMA_SPEC_DRAFT", "2")))
+                n_draft = max(1, int(os.environ.get("XLLAMA_SPEC_DRAFT", "1")))
 
                 _SPEC_ENUM = {
                     "mtp":    "COMMON_SPECULATIVE_TYPE_DRAFT_MTP",
